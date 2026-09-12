@@ -30,13 +30,13 @@ class TrainConfig:
 
 
 class PairAttackDataset(Dataset):
-    """Deterministic clean/attacked pairs for reproducible training."""
+    """Deterministic clean/attacked pairs for reproducible multi-attack training."""
 
     def __init__(
         self,
         images: np.ndarray,
         labels: np.ndarray,
-        attack_names: Iterable[str] = ("gaussian_noise", "blur", "jpeg", "rotation", "compound"),
+        attack_names: Iterable[str] = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compound"),
     ) -> None:
         images = np.asarray(images, dtype=np.float32)
         labels = np.asarray(labels)
@@ -55,21 +55,18 @@ class PairAttackDataset(Dataset):
 
     def _attack(self, clean: np.ndarray, index: int) -> np.ndarray:
         name = self.attack_names[index % len(self.attack_names)]
-        if name == "gaussian_noise":
-            return ATTACKS[name](clean, sigma=0.03, seed=index)
-        if name == "compound":
-            return ATTACKS[name](clean, seed=index)
-        # Deterministic fixed-strength defaults for the training augmentation grid.
         defaults = {
-            "blur": {"sigma": 1.0},
-            "median_blur": {"kernel": 3},
+            "gaussian_noise": {"sigma": 0.03, "seed": index},
             "salt_pepper": {"amount": 0.01, "seed": index},
+            "gaussian_blur": {"sigma": 1.0},
+            "median_blur": {"size": 3},
             "jpeg": {"quality": 70},
             "brightness": {"factor": 1.10},
             "contrast": {"factor": 1.15},
-            "rotation": {"angle": 5.0},
-            "crop_resize": {"fraction": 0.90},
-            "translation": {"dx": 3, "dy": 2},
+            "rotation": {"degrees": 5.0},
+            "crop_resize": {"fraction": 0.05},
+            "translation": {"pixels": 3},
+            "compound": {"seed": index},
         }
         return ATTACKS[name](clean, **defaults.get(name, {}))
 
@@ -98,18 +95,18 @@ def objective_terms(clean: Tensor, attacked: Tensor, labels: Tensor, margin: flo
     negative = distances.masked_fill(same, float("inf"))
     hard_negative = negative.min(dim=1).values
     valid = torch.isfinite(hard_negative)
-    if valid.any():
-        discrimination = torch.relu(margin - hard_negative[valid]).mean()
-    else:
-        discrimination = clean.new_tensor(0.0)
+    discrimination = (
+        torch.relu(margin - hard_negative[valid]).mean()
+        if valid.any()
+        else clean.new_tensor(0.0)
+    )
 
     p = clean.mean(dim=0).clamp(1e-5, 1.0 - 1e-5)
     balance = (p - 0.5).pow(2).mean()
     entropy = -(p * torch.log2(p) + (1.0 - p) * torch.log2(1.0 - p)).mean()
 
     centered = clean - clean.mean(dim=0, keepdim=True)
-    denom = max(clean.shape[0] - 1, 1)
-    cov = centered.T @ centered / denom
+    cov = centered.T @ centered / max(clean.shape[0] - 1, 1)
     off_diag = cov - torch.diag(torch.diagonal(cov))
     decorrelation = off_diag.pow(2).mean()
 
@@ -130,85 +127,72 @@ def _flatten_gradients(grads: list[Tensor | None], params: list[Tensor]) -> Tens
 
 
 def _project_simplex(x: Tensor) -> Tensor:
-    """Euclidean projection onto {w >= 0, sum(w)=1}."""
+    """Euclidean projection onto the probability simplex."""
     if x.numel() == 1:
         return torch.ones_like(x)
     u, _ = torch.sort(x, descending=True)
     cssv = torch.cumsum(u, dim=0) - 1.0
-    idx = torch.arange(1, x.numel() + 1, device=x.device, dtype=x.dtype)
-    cond = u - cssv / idx > 0
+    rho_candidates = torch.arange(1, x.numel() + 1, device=x.device, dtype=x.dtype)
+    cond = u - cssv / rho_candidates > 0
     rho = torch.where(cond)[0][-1]
     theta = cssv[rho] / (rho + 1.0)
     return torch.clamp(x - theta, min=0.0)
 
 
-def mgda_weights(
-    losses: list[Tensor],
-    model: nn.Module,
-    steps: int = 25,
-    lr: float = 0.25,
-) -> Tensor:
-    """Approximate the MGDA minimum-norm solution on the task simplex.
+def mgda_weights(losses: list[Tensor], model: nn.Module, steps: int = 25) -> Tensor:
+    """Compute a minimum-norm multi-gradient simplex weighting.
 
-    We form one gradient vector per objective and solve
-        min_w ||sum_i w_i g_i||^2  subject to w_i >= 0, sum_i w_i = 1
-    with projected gradient descent. The weights are detached because they are
-    determined by the current task gradients rather than optimized parameters.
+    The task weights solve min ||sum_i w_i g_i||^2 subject to w >= 0 and sum(w)=1.
+    Projected gradient descent on the task Gram matrix gives a deterministic,
+    lightweight MGDA-style solver without adding an external dependency.
     """
-    params = [p for p in model.parameters() if p.requires_grad]
     if not losses:
         raise ValueError("losses must not be empty")
-    gradient_vectors = []
+    params = [p for p in model.parameters() if p.requires_grad]
+    vectors = []
     for loss in losses:
         grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
-        gradient_vectors.append(_flatten_gradients(grads, params))
-    G = torch.stack(gradient_vectors, dim=1)  # [P, T]
+        vectors.append(_flatten_gradients(grads, params))
+    G = torch.stack(vectors, dim=1)
     gram = G.T @ G
-    n_tasks = len(losses)
-    weights = torch.full((n_tasks,), 1.0 / n_tasks, device=G.device, dtype=G.dtype)
-    lipschitz = float(2.0 * torch.linalg.matrix_norm(gram, ord=2).detach().cpu()) if n_tasks > 1 else 1.0
-    step = min(lr, 1.0 / max(lipschitz, 1e-6))
+    task_count = len(losses)
+    weights = torch.full((task_count,), 1.0 / task_count, dtype=G.dtype, device=G.device)
+    spectral = float(torch.linalg.matrix_norm(gram, ord=2).detach().cpu()) if task_count > 1 else 1.0
+    step = min(0.25, 1.0 / max(2.0 * spectral, 1e-6))
     for _ in range(max(1, steps)):
-        grad_w = 2.0 * (gram @ weights)
-        weights = _project_simplex(weights - step * grad_w)
+        weights = _project_simplex(weights - step * (2.0 * gram @ weights))
     return weights.detach()
 
 
 def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str | None = None):
-    """Train CAP-ZW with MGDA-balanced robustness/discrimination/hash-quality tasks."""
+    """Train CAP-ZW using collision-aware objectives and MGDA task balancing."""
     device = torch.device(config.device)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
     history: list[dict[str, float]] = []
 
+    task_names = ["robustness", "discrimination", "balance", "decorrelation", "entropy_penalty"]
+    totals_keys = task_names + ["total"]
+
     for epoch in range(config.epochs):
         model.train()
-        totals = {k: 0.0 for k in ["robustness", "discrimination", "balance", "decorrelation", "entropy_penalty", "total"]}
-        weight_totals = np.zeros(5, dtype=np.float64)
+        totals = {key: 0.0 for key in totals_keys}
+        weight_totals = np.zeros(len(task_names), dtype=np.float64)
         batches = 0
 
         for batch in loader:
-            if len(batch) == 4:
-                clean_x, attacked_x, labels, _ = batch
-            else:
-                clean_x, attacked_x, labels = batch
+            clean_x, attacked_x, labels = batch[:3]
             clean_x = clean_x.to(device, non_blocking=True)
             attacked_x = attacked_x.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            # BEMQ hard=False already returns probabilities; do NOT sigmoid twice.
+            # BEMQ(hard=False) already returns probabilities; avoid a second sigmoid.
             clean = model(clean_x, hard=False)
             attacked = model(attacked_x, hard=False)
             terms = objective_terms(clean, attacked, labels, config.margin)
-            tasks = [
-                terms["robustness"],
-                terms["discrimination"],
-                terms["balance"],
-                terms["decorrelation"],
-                terms["entropy_penalty"],
-            ]
+            tasks = [terms[name] for name in task_names]
             mgda = mgda_weights(tasks, model)
-            scaled = torch.tensor(
+            scale = torch.tensor(
                 [
                     config.lambda_robust,
                     config.lambda_collision,
@@ -216,10 +200,10 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
                     config.lambda_corr,
                     config.lambda_entropy,
                 ],
-                device=device,
                 dtype=mgda.dtype,
+                device=device,
             )
-            effective = mgda * scaled
+            effective = mgda * scale
             effective = effective / effective.sum().clamp_min(1e-12)
             loss = sum(weight * task for weight, task in zip(effective, tasks))
 
@@ -237,8 +221,7 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
         denom = max(batches, 1)
         row = {"epoch": float(epoch + 1)}
         row.update({key: value / denom for key, value in totals.items()})
-        for index, name in enumerate(["w_robust", "w_discrimination", "w_balance", "w_corr", "w_entropy"]):
-            row[name] = float(weight_totals[index] / denom)
+        row.update({f"w_{name}": float(weight_totals[i] / denom) for i, name in enumerate(["robust", "discrimination", "balance", "corr", "entropy"])})
         history.append(row)
 
         if checkpoint:
