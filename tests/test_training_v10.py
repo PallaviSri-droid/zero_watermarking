@@ -12,7 +12,8 @@ def test_v10_version_and_defaults():
 
 
 def test_robustness_guard_is_finite_and_differentiable():
-    clean = torch.sigmoid(torch.randn(8, 16, requires_grad=True))
+    clean = torch.sigmoid(torch.randn(8, 16))
+    clean.retain_grad()
     attacked = (clean + 0.02 * torch.randn_like(clean)).clamp(0, 1)
     penalty, violation, q_value = _robustness_guard(
         clean,
