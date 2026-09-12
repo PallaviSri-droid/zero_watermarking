@@ -36,7 +36,6 @@ def download_and_extract(root: Path, force: bool) -> Path:
             raise SystemExit("Install Kaggle first: pip install kaggle, then run: kaggle auth login") from exc
         marker.write_text("ok\n", encoding="utf-8")
 
-    # Kaggle may provide nested image ZIPs. Extract every ZIP recursively.
     changed = True
     while changed:
         changed = False
@@ -56,7 +55,7 @@ def download_and_extract(root: Path, force: bool) -> Path:
 def locate_metadata(root: Path) -> Path:
     candidates = list(root.rglob("Data_Entry_2017*.csv")) + list(root.rglob("data_entry_2017*.csv"))
     if not candidates:
-        raise SystemExit("Could not find the NIH metadata CSV (Data_Entry_2017*.csv) after extraction.")
+        raise SystemExit("Could not find NIH metadata CSV (Data_Entry_2017*.csv) after extraction.")
     return candidates[0]
 
 
@@ -84,6 +83,9 @@ def build_manifest(root: Path, output: Path, max_images: int | None) -> int:
     if missing:
         raise SystemExit(f"NIH metadata is missing columns: {sorted(missing)}")
 
+    # Do not use DataFrame.itertuples attribute access for columns containing spaces.
+    # Direct indexing is robust to pandas' tuple-name sanitization.
+    meta = meta.copy()
     meta["Image Index"] = meta["Image Index"].astype(str)
     meta["Patient ID"] = meta["Patient ID"].astype(str)
     official = load_official_split(root)
@@ -94,22 +96,21 @@ def build_manifest(root: Path, output: Path, max_images: int | None) -> int:
             image_map.setdefault(image.name, image)
 
     rows: list[dict[str, str]] = []
-    for row in meta.itertuples(index=False):
-        filename = str(getattr(row, "Image_Index"))
+    for _, record in meta.iterrows():
+        filename = str(record["Image Index"])
         path = image_map.get(filename)
         if path is None:
             continue
-        labels = str(getattr(row, "Finding_Labels"))
         split = official.get(filename, "unknown")
         rows.append(
             {
                 "image_id": Path(filename).stem,
                 "path": path.resolve().as_posix(),
-                "group_id": str(getattr(row, "Patient_ID")),
+                "group_id": str(record["Patient ID"]),
                 "modality": "chest_xray",
-                "label": labels,
+                "label": str(record["Finding Labels"]),
                 "split": split,
-                "view_position": str(getattr(row, "View_Position", "unknown")),
+                "view_position": str(record.get("View Position", "unknown")),
                 "group_inferred": "false",
             }
         )
@@ -117,7 +118,7 @@ def build_manifest(root: Path, output: Path, max_images: int | None) -> int:
             break
 
     if not rows:
-        raise SystemExit("No NIH images could be matched to the metadata CSV. Check extraction/download completeness.")
+        raise SystemExit("No NIH images could be matched to metadata. Check extraction/download completeness.")
 
     frame = pd.DataFrame(rows).drop_duplicates(subset=["image_id"]).reset_index(drop=True)
     output.parent.mkdir(parents=True, exist_ok=True)
