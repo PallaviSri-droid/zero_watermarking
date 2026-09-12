@@ -44,7 +44,12 @@ class TrainConfig:
 class PairAttackDataset(Dataset):
     """Deterministic clean/attacked pairs for reproducible multi-attack training."""
 
-    def __init__(self, images: np.ndarray, labels: np.ndarray, attack_names: Iterable[str] = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compound")) -> None:
+    def __init__(
+        self,
+        images: np.ndarray,
+        labels: np.ndarray,
+        attack_names: Iterable[str] = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compound"),
+    ) -> None:
         images = np.asarray(images, dtype=np.float32)
         labels = np.asarray(labels)
         if images.ndim != 3:
@@ -56,6 +61,9 @@ class PairAttackDataset(Dataset):
             raise ValueError("attack_names must contain valid non-clean attack names")
         self.images = np.clip(images, 0.0, 1.0)
         self.labels = labels.astype(np.int64)
+
+    def __len__(self) -> int:
+        return int(len(self.images))
 
     def _attack(self, clean: np.ndarray, index: int) -> np.ndarray:
         name = self.attack_names[index % len(self.attack_names)]
@@ -78,7 +86,12 @@ class PairAttackDataset(Dataset):
         clean = self.images[index]
         attack_name = self.attack_names[index % len(self.attack_names)]
         attacked = self._attack(clean, index)
-        return (torch.from_numpy(clean[None]), torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None]), torch.tensor(int(self.labels[index]), dtype=torch.long), attack_name)
+        return (
+            torch.from_numpy(clean[None]),
+            torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None]),
+            torch.tensor(int(self.labels[index]), dtype=torch.long),
+            attack_name,
+        )
 
 
 def _normalized_hamming(z1: Tensor, z2: Tensor) -> Tensor:
@@ -121,14 +134,26 @@ def _uniformity_loss(distances: Tensor | None, temperature: float, topk: int, de
     return torch.stack([torch.exp(-r / tau).mean() for r in rows]).mean()
 
 
-def objective_terms(clean: Tensor, attacked: Tensor, labels: Tensor, margin: float, memory_codes: Tensor | None = None, memory_labels: Tensor | None = None, collision_power: float = 2.0, topk_negatives: int = 8, diversity_target: float = 0.45, tail_target: float = 0.34, uniformity_temperature: float = 0.08, robustness_quantile: float = 0.80) -> Dict[str, Tensor]:
+def objective_terms(
+    clean: Tensor,
+    attacked: Tensor,
+    labels: Tensor,
+    margin: float,
+    memory_codes: Tensor | None = None,
+    memory_labels: Tensor | None = None,
+    collision_power: float = 2.0,
+    topk_negatives: int = 8,
+    diversity_target: float = 0.45,
+    tail_target: float = 0.34,
+    uniformity_temperature: float = 0.08,
+    robustness_quantile: float = 0.80,
+) -> Dict[str, Tensor]:
     """CAP-ZW v5 objectives: robustness + collision-tail separation + code-space quality."""
     if clean.ndim != 2 or attacked.ndim != 2 or clean.shape != attacked.shape:
         raise ValueError("clean and attacked must both have shape [B, nbits]")
     pair_codes = torch.cat([clean, attacked], dim=0)
     pair_labels = torch.cat([labels, labels], dim=0)
 
-    # Hash robustness is measured per sample over bits (model outputs are [B, nbits]).
     per_sample_robust = (clean - attacked).abs().mean(dim=1)
     q = float(min(max(robustness_quantile, 0.5), 1.0))
     q_value = torch.quantile(per_sample_robust.detach(), q)
@@ -174,7 +199,15 @@ def objective_terms(clean: Tensor, attacked: Tensor, labels: Tensor, margin: flo
     eye = torch.eye(corr_mat.shape[0], device=combined.device, dtype=combined.dtype)
     decorrelation = ((corr_mat - eye) * (1.0 - eye)).pow(2).mean()
 
-    return {"robustness": robustness, "tail_collision": tail_collision, "diversity": diversity, "balance": balance, "decorrelation": decorrelation, "entropy_penalty": 1.0 - entropy, "uniformity": uniformity}
+    return {
+        "robustness": robustness,
+        "tail_collision": tail_collision,
+        "diversity": diversity,
+        "balance": balance,
+        "decorrelation": decorrelation,
+        "entropy_penalty": 1.0 - entropy,
+        "uniformity": uniformity,
+    }
 
 
 def _flatten_gradients(grads: list[Tensor | None], params: list[Tensor]) -> Tensor:
@@ -287,7 +320,7 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
 
 
 class CAPZWHashNet(HashEncoder):
-    """CAP-ZW v5: BEMQ encoder with explicit collision-tail objectives."""
+    """CAP-ZW v5: BEMQ encoder with tail-aware collision optimization."""
 
     def __init__(self, nbits: int = 256, base_channels: int = 32):
         super().__init__(nbits=nbits, base_channels=base_channels, use_bemq=True)
