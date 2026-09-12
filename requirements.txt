@@ -13,3 +13,5 @@ jupyter>=1.0
 ipykernel>=6.29
 torch>=2.2
 torchvision>=0.17
+dtcwt>=0.14
+pytest>=8.0
