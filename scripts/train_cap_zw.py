@@ -13,7 +13,8 @@ from zero_watermarking.synthetic import make_dataset
 from zero_watermarking.training import CAPZWHashNet, PairAttackDataset, TrainConfig, train_cap_zw
 
 
-DEFAULT_ATTACKS = ("gaussian_noise", "blur", "jpeg", "rotation", "compound")
+# Names must match zero_watermarking.attacks.ATTACKS exactly.
+DEFAULT_ATTACKS = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compound")
 
 
 def main() -> int:
@@ -49,8 +50,6 @@ def main() -> int:
             raise SystemExit(f"Need at least 4 existing training images in split={args.split}.")
         frame = frame.head(args.limit)
         images = np.stack([load_image(row.path, args.size) for row in frame.itertuples(index=False)])
-        # Each training image is its own verification identity; attacked views
-        # of that image form the positive pair.
         labels = np.arange(len(images), dtype=np.int64)
     else:
         generated = make_dataset(args.images, args.size)
