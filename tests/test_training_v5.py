@@ -1,9 +1,9 @@
 import torch
 
-from zero_watermarking.training import objective_terms
+from zero_watermarking.training import CAP_ZW_VERSION, objective_terms
 
 
-def test_objective_terms_v5_shape_and_finite():
+def test_objective_terms_current_version_shape_and_finite():
     torch.manual_seed(7)
     clean = torch.sigmoid(torch.randn(6, 16))
     attacked = (clean + 0.02 * torch.randn_like(clean)).clamp(0, 1)
@@ -22,7 +22,18 @@ def test_objective_terms_v5_shape_and_finite():
         tail_target=0.34,
         uniformity_temperature=0.08,
     )
-    expected = {"robustness", "tail_collision", "diversity", "balance", "decorrelation", "entropy_penalty", "uniformity"}
+    expected = {
+        "robustness",
+        "tail_collision",
+        "diversity",
+        "balance",
+        "decorrelation",
+        "entropy_penalty",
+        "uniformity",
+        "consistency",
+        "binary_collision",
+    }
+    assert CAP_ZW_VERSION == "CAP-ZW-v8"
     assert set(terms) == expected
     assert all(torch.isfinite(value).item() for value in terms.values())
     assert all(value.ndim == 0 for value in terms.values())
