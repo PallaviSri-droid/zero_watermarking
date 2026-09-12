@@ -48,17 +48,26 @@ def mean_abs_corr(bits: np.ndarray) -> float:
 
 
 def roc_stats(genuine_scores, impostor_scores):
+    """Compute ROC metrics where larger scores mean 'same image'."""
     y = np.r_[np.ones(len(genuine_scores)), np.zeros(len(impostor_scores))]
     scores = np.r_[genuine_scores, impostor_scores]
     auc = float(roc_auc_score(y, scores))
-    fpr, tpr, _ = roc_curve(y, scores)
+    fpr, tpr, thresholds = roc_curve(y, scores)
     fnr = 1 - tpr
     i = int(np.nanargmin(np.abs(fpr - fnr)))
     eer = float((fpr[i] + fnr[i]) / 2)
-    return {"auc": auc, "eer": eer, "fpr": fpr, "tpr": tpr}
+    return {
+        "auc": auc,
+        "eer": eer,
+        "fpr": fpr,
+        "tpr": tpr,
+        "fnr": fnr,
+        "thresholds": thresholds,
+    }
 
 
 def evaluate_hash_bank(clean_bank, attacked_bank):
+    """Evaluate robustness and verification discrimination on a hash bank."""
     ids = sorted(clean_bank)
     intra, inter, genuine_nc, rows = [], [], [], []
     for image_id in ids:
@@ -73,11 +82,16 @@ def evaluate_hash_bank(clean_bank, attacked_bank):
         for j in ids[pos + 1 :]:
             inter.append(hamming(clean_bank[i], clean_bank[j]))
 
-    rs = roc_stats([1 - x for x in intra], inter)
+    # Both genuine and impostor verification scores must have the same
+    # orientation: larger = more likely to belong to the same image.
+    genuine_scores = [1.0 - x for x in intra]
+    impostor_scores = [1.0 - x for x in inter]
+    rs = roc_stats(genuine_scores, impostor_scores)
     collision_gap = (min(inter) if inter else np.nan) - (max(intra) if intra else np.nan)
     return {
         "mean_intra_hd": float(np.mean(intra)) if intra else np.nan,
         "max_intra_hd": float(np.max(intra)) if intra else np.nan,
+        "mean_ber": float(np.mean(intra)) if intra else np.nan,
         "mean_nc": float(np.mean(genuine_nc)) if genuine_nc else np.nan,
         "min_inter_hd": float(np.min(inter)) if inter else np.nan,
         "mean_inter_hd": float(np.mean(inter)) if inter else np.nan,
