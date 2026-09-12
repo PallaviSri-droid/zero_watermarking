@@ -1,174 +1,159 @@
 # Collision-Aware Pareto Zero-Watermarking for Medical Images
 
-A reproducible research codebase for medical-image zero-watermarking with a benchmark-first protocol.
+A reproducible research codebase for **collision-aware medical-image zero-watermarking**, with explicit robustness, discriminability and collision-tail evaluation.
 
-## Research goal
+> **Research status:** the repository contains a locked candidate, reference checkpoints and the full evaluation protocol, but no scientific superiority claim is made until the controlled multi-seed benchmark is completed.
 
-The project tests whether jointly optimizing same-image robustness, different-image separation, collision-tail risk, bit balance, entropy and decorrelation can improve the robustness/discriminability trade-off compared with classical and learning-based baselines.
+## Research question
 
-Working research label: **CAP-ZW (Collision-Aware Pareto Zero-Watermarking)**. This is a research label, not a claim of prior publication.
+Does explicitly coupling attacked-view robustness, different-image separation and cross-image collision-tail risk produce a better zero-watermarking operating point than conventional robustness-only objectives?
 
-## Current learned formulation
+The working research label is **CAP-ZW (Collision-Aware Pareto Zero-Watermarking)**. It is a project label, not a claim of prior publication.
 
-The project preserves the original CAP-ZW-v9 collision-focused formulation as the strongest current comparison model and adds **CAP-ZW-v11** as the active development formulation. v10 is retained as an evaluated robustness-guard variant but is not treated as the preferred operating point.
+## Scientific contribution
 
-CAP-ZW-v9 uses:
+The intended contribution is the **collision-aware multi-objective formulation and evaluation protocol**. Components such as STE/BEMQ, balanced hashing, contrastive learning, CNN features, hard-negative mining and MGDA-style optimization are treated as established building blocks rather than individually novel contributions.
 
-- cross-batch memory mining;
-- top-k hard-negative separation;
-- continuous collision-tail and diversity objectives;
-- discrete thresholded-code collision control;
-- collision-mass pressure over multiple hardest negatives;
-- multi-view attack training;
-- robustness-budget / floor regularization;
-- clean/attacked consistency;
-- clean + attacked bit balance and entropy regularization;
-- hard-code-aware decorrelation;
-- MGDA-style multi-objective gradient weighting.
-
-CAP-ZW-v11 keeps the v9 objective but adds a **selective robustness guard** that focuses on the worst robustness fraction of each batch plus a high-quantile term, rather than imposing a strong global robustness constraint. The guard is intentionally soft and adaptive so that collision/discriminability objectives can remain active when the model is already within its robustness budget.
-
-The central hypothesis is not that any individual ingredient is new. The research question is whether this **joint collision-aware formulation and evaluation protocol** produces a measurable improvement in the robustness/discriminability trade-off and reduces cross-image hash collisions under a common medical-image benchmark.
-
-## Metrics
-
-Core diagnostic:
-
-`collision_gap = min(inter-image Hamming distance) - max(intra-image Hamming distance)`
-
-Tail diagnostics include:
-
-- `inter_q05`, `inter_q10`
-- `intra_q90`, `intra_q95`
-- `q05_tail_gap`, `q10_tail_gap`
-- near-collision, ultra-near-collision and exact-collision counts
-
-Primary performance metrics are NC, BER, intra-image Hamming distance, inter-image Hamming distance, ROC-AUC, EER, balance error, bit entropy and mean absolute inter-bit correlation.
-
-## Workflow
+## Repository structure
 
 ```text
-Dataset / preprocessing
-        ↓
-Classical baselines
-        ↓
-Attack engine
-        ↓
-Robustness evaluation
-        ↓
-Discriminability + collision-tail analysis
-        ↓
-CAP-ZW-v9 baseline
-        ↓
-CAP-ZW-v11 selective-robustness refinement
-        ↓
-Ablation study
-        ↓
-Multi-seed statistics / confidence intervals
-        ↓
-Publication figures / tables
+src/zero_watermarking/      Core algorithms, attacks, metrics, training and protocol
+scripts/                    Reproducible training, evaluation and multi-seed runners
+configs/                    Locked experimental configurations
+notebooks/                  Analysis and publication-figure notebooks
+reports/                    Research protocol, literature matrix and publication checklist
+tests/                      Regression/unit tests
 ```
 
-## Benchmark principles
+## Benchmark contract
 
-All compared methods use the same image split, image size, hash length, attack set and evaluator. Synthetic medical-like phantoms are included only as deterministic smoke-test data; scientific claims must use an approved real medical dataset and explicitly report its split and preprocessing.
+Every main-table comparison must use the same patient/group split, image preprocessing, hash length, attack grid, negative-pair evaluation design, metric implementation and decision rule.
 
-Reproduced results are kept separate from values quoted from the literature. No improvement percentage is hard-coded or fabricated.
+### Robustness
 
-DCT, DTCWT, KAZE, contrastive learning, balanced hashing, STE/BEMQ, BCH, chaos and multi-objective optimization are individually established ideas. Novelty must therefore be demonstrated by the specific formulation, integration, protocol and evidence.
+- mean NC ↑
+- mean BER ↓
+- mean intra-image normalized Hamming distance ↓
+- maximum intra-image normalized Hamming distance ↓
 
-## Quick start
+### Discriminability
+
+- mean inter-image normalized Hamming distance ↑
+- minimum inter-image normalized Hamming distance ↑
+- ROC-AUC ↑
+- EER ↓
+- FAR/FRR at a stated operating threshold
+
+### Collision risk
+
+Report both counts and rates per 10,000 negative pairs:
+
+- exact collision (`HD = 0`);
+- ultra-near collision (`HD <= 0.05`);
+- near collision (`HD <= 0.10`).
+
+### Tail separation and hash quality
+
+Report inter q01/q05/q10, intra q90/q95, q05/q10 tail gaps, balance error, mean bit entropy and mean absolute off-diagonal bit correlation.
+
+`collision_gap = min(inter-image HD) - max(intra-image HD)` is a diagnostic and is not used as the sole collision criterion.
+
+## Current development checkpoints
+
+- **CAP-ZW-v9:** strongest current collision/discrimination pilot.
+- **CAP-ZW-v10:** robustness-guard experiment showing that overly strong global robustness pressure can damage hash diversity and collision separation.
+- **CAP-ZW-v11:** selective robustness refinement.
+- **CAP-ZW-final-candidate:** locked candidate combining collision-focused v9 mechanisms with the selective robustness guard from v11. It must still be selected/validated through controlled multi-seed experiments.
+
+The repository deliberately avoids uncontrolled hand-tuned version chasing. See `reports/cap_zw_final_research_spec.md` and `reports/journal_protocol.md`.
+
+## Reproducible experiment sequence
+
+### 1. Environment
 
 ```bash
 python -m pip install -r requirements.txt
 python -m pip install -e .
-python scripts/run_all.py
+python -m pytest -q
 ```
 
-## CAP-ZW-v11 training
+### 2. Dataset
 
-The v11 trainer is isolated from the original v9 CLI so that both configurations remain reproducible:
+The primary real-data benchmark is **NIH ChestX-ray14**. Keep raw images outside Git and construct a manifest containing image paths plus patient/group identifiers. The test split must remain locked during model selection.
 
-```powershell
-python scripts\train_cap_zw_v11.py --help
+The preparation utility is:
+
+```bash
+python scripts/prepare_nih_chestxray14.py --max-images 5000
 ```
 
-A controlled pilot can be run with:
+For Kaggle authentication, use the credential mechanism supported by the installed Kaggle CLI; never commit credentials or paste API keys into source files.
 
-```powershell
-python scripts\train_cap_zw_v11.py `
-  --manifest data\manifests\medical_manifest.csv `
-  --split train_val `
-  --limit 512 `
-  --size 128 `
-  --bits 128 `
-  --epochs 3 `
-  --batch-size 8 `
-  --memory-size 1024 `
-  --memory-warmup 128 `
-  --topk-negatives 12 `
-  --robust-target 0.022 `
-  --robust-softness 0.008 `
-  --robustness-quantile 0.80 `
-  --attack-views 3 `
-  --tail-target 0.26 `
-  --diversity-target 0.36 `
-  --binary-collision-target 0.135 `
-  --temperature 0.08 `
-  --guard-target 0.021 `
-  --guard-quantile 0.85 `
-  --guard-softness 0.008 `
-  --guard-lambda 0.55 `
-  --guard-growth 0.10 `
-  --guard-max 2.50 `
-  --guard-tail-weight 0.70 `
-  --guard-mean-weight 0.20 `
-  --guard-batch-fraction 0.25 `
-  --mgda-steps 15
+### 3. Train the locked candidate
+
+```bash
+python scripts/train_cap_zw_final.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --split train_val \
+  --limit 5000 \
+  --size 128 \
+  --bits 256 \
+  --epochs 10 \
+  --batch-size 16 \
+  --seed 42 \
+  --device auto
 ```
 
-## Evaluation
+### 4. Run the five-seed selection benchmark
 
-```powershell
-python scripts\evaluate_cap_zw.py `
-  --manifest data\manifests\medical_manifest.csv `
-  --split test `
-  --checkpoint experiments\checkpoints\cap_zw_v11.pt `
-  --limit 200 `
-  --size 128 `
-  --bits 128
+```bash
+python scripts/run_cap_zw_multiseed.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --split train_val \
+  --seeds 13 23 42 73 97 \
+  --limit 5000 \
+  --size 128 \
+  --bits 256 \
+  --epochs 10 \
+  --batch-size 16 \
+  --device auto \
+  --skip-existing
 ```
 
-The evaluator resolves the model version from checkpoint metadata rather than hard-coding a version string.
+Shortlisted configurations require five independent seeds for publication statistics; two seeds are reserved for early smoke screening.
 
-## Recommended real dataset: NIH ChestX-ray14
+### 5. Evaluate the locked test set
 
-For the first full experiment we use **NIH ChestX-ray14**. It contains 112,120 frontal chest X-rays from 30,805 patients and includes 14 thoracic pathology labels. The Kaggle mirror is convenient for local download, while the patient identifier can be used directly as `group_id` to prevent patient-level leakage.
-
-Kaggle authentication:
-
-```powershell
-kaggle auth login
+```bash
+python scripts/evaluate_cap_zw.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --split test \
+  --checkpoint experiments/checkpoints/cap_zw_final_seed42.pt \
+  --limit 200 \
+  --size 128 \
+  --bits 256
 ```
 
-Prepare a reproducible manifest:
+Do not tune the final test threshold after seeing the test results.
 
-```powershell
-python scripts\prepare_nih_chestxray14.py --max-images 5000
-```
+## Publication analysis
 
-The resulting manifest is:
+Use the analysis notebooks to generate the paper tables and figures only from retained seed-level outputs. Report mean, standard deviation and 95% Student-t confidence intervals across seeds. Always retain the negative-pair denominator for collision statistics.
 
-```text
-data/manifests/medical_manifest.csv
-```
+The paper-ready minimum figure set is documented in `reports/journal_protocol.md`.
 
-For publication experiments, keep the exact manifest, split, preprocessing, seed, hash length, attack grid and configuration used for every reported experiment.
+## Reproducibility
 
-## External validation plan
+Every reported result should be traceable to:
 
-After the NIH experiment is stable, add **CheXpert** and/or **MIMIC-CXR-JPG** for external validation. These datasets have different access procedures and should not block the main NIH pipeline.
+`commit → configuration → seed → manifest → checkpoint → evaluator → attack grid → metrics`
 
-## Research status
+The project intentionally does not version raw datasets, checkpoints or large experiment outputs.
 
-CAP-ZW-v9 remains the strongest evaluated collision-focused reference from the current development cycle. CAP-ZW-v10 demonstrated that an overly strong global robustness guard can collapse bit diversity and collision separation. CAP-ZW-v11 is the next controlled refinement and requires fresh execution, multi-seed evaluation, confidence intervals, and the complete ablation/benchmark matrix before any scientific superiority claim is made.
+## External validation
+
+After the NIH pipeline is stable, add CheXpert and/or MIMIC-CXR-JPG using their own access/licensing procedures. These datasets are external validation, not a substitute for a reproducible NIH main benchmark.
+
+## Citation
+
+A machine-readable citation record is provided in `CITATION.cff`. Please cite the repository version/commit used for reproducibility.
