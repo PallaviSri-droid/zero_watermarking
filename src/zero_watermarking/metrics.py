@@ -37,18 +37,33 @@ def bit_entropy(bits: np.ndarray):
 
 
 def mean_abs_corr(bits: np.ndarray) -> float:
+    """Mean absolute pairwise bit correlation, ignoring constant columns.
+
+    Constant hash bits have undefined Pearson correlation. They are excluded
+    rather than passing NaNs into publication tables or emitting NumPy warnings.
+    """
     b = np.asarray(bits).astype(float)
-    if b.shape[0] < 3 or b.shape[1] < 2:
-        return float("nan")
-    c = np.corrcoef(b, rowvar=False)
-    iu = np.triu_indices_from(c, k=1)
-    vals = np.abs(c[iu])
+    if b.ndim != 2 or b.shape[0] < 2 or b.shape[1] < 2:
+        return 0.0
+    keep = np.std(b, axis=0) > 1e-12
+    b = b[:, keep]
+    if b.shape[1] < 2:
+        return 0.0
+    centered = b - b.mean(axis=0, keepdims=True)
+    denom = np.linalg.norm(centered, axis=0)
+    corr = (centered.T @ centered) / np.outer(denom, denom)
+    iu = np.triu_indices_from(corr, k=1)
+    vals = np.abs(corr[iu])
     vals = vals[np.isfinite(vals)]
     return float(vals.mean()) if len(vals) else 0.0
 
 
 def roc_stats(genuine_scores, impostor_scores):
     """Compute ROC metrics where larger scores mean 'same image'."""
+    genuine_scores = np.asarray(genuine_scores, dtype=float)
+    impostor_scores = np.asarray(impostor_scores, dtype=float)
+    if genuine_scores.size == 0 or impostor_scores.size == 0:
+        raise ValueError("ROC requires both genuine and impostor scores")
     y = np.r_[np.ones(len(genuine_scores)), np.zeros(len(impostor_scores))]
     scores = np.r_[genuine_scores, impostor_scores]
     auc = float(roc_auc_score(y, scores))
@@ -69,6 +84,8 @@ def roc_stats(genuine_scores, impostor_scores):
 def evaluate_hash_bank(clean_bank, attacked_bank):
     """Evaluate robustness and verification discrimination on a hash bank."""
     ids = sorted(clean_bank)
+    if len(ids) < 2:
+        raise ValueError("At least two images are required for discrimination metrics")
     intra, inter, genuine_nc, rows = [], [], [], []
     for image_id in ids:
         clean = clean_bank[image_id]
@@ -82,19 +99,17 @@ def evaluate_hash_bank(clean_bank, attacked_bank):
         for j in ids[pos + 1 :]:
             inter.append(hamming(clean_bank[i], clean_bank[j]))
 
-    # Both genuine and impostor verification scores must have the same
-    # orientation: larger = more likely to belong to the same image.
     genuine_scores = [1.0 - x for x in intra]
     impostor_scores = [1.0 - x for x in inter]
     rs = roc_stats(genuine_scores, impostor_scores)
-    collision_gap = (min(inter) if inter else np.nan) - (max(intra) if intra else np.nan)
+    collision_gap = min(inter) - max(intra)
     return {
-        "mean_intra_hd": float(np.mean(intra)) if intra else np.nan,
-        "max_intra_hd": float(np.max(intra)) if intra else np.nan,
-        "mean_ber": float(np.mean(intra)) if intra else np.nan,
-        "mean_nc": float(np.mean(genuine_nc)) if genuine_nc else np.nan,
-        "min_inter_hd": float(np.min(inter)) if inter else np.nan,
-        "mean_inter_hd": float(np.mean(inter)) if inter else np.nan,
+        "mean_intra_hd": float(np.mean(intra)),
+        "max_intra_hd": float(np.max(intra)),
+        "mean_ber": float(np.mean(intra)),
+        "mean_nc": float(np.mean(genuine_nc)),
+        "min_inter_hd": float(np.min(inter)),
+        "mean_inter_hd": float(np.mean(inter)),
         "collision_gap": float(collision_gap),
         "auc": rs["auc"],
         "eer": rs["eer"],
