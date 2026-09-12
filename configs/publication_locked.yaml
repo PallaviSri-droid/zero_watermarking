@@ -1,0 +1,50 @@
+# Locked starting configuration for the publication benchmark.
+# Selection must still be performed on train/validation data before the test set is unlocked.
+experiment:
+  name: cap_zw_publication_locked
+  method: CAP-ZW-final-candidate
+  size: 128
+  bits: 256
+  train_split: train_val
+  test_split: test
+  default_limit: 5000
+  shortlist_seeds: [13, 23, 42, 73, 97]
+  smoke_seeds: [13, 42]
+
+training:
+  epochs: 10
+  batch_size: 16
+  learning_rate: 0.0005
+  device: auto
+
+collision_control:
+  topk_negatives: 12
+  memory_size: 4096
+  memory_warmup: 384
+  collision_power: 2.0
+  binary_collision_target: 0.135
+
+robustness_guard:
+  target: 0.021
+  quantile: 0.85
+  softness: 0.008
+  lambda_init: 0.55
+  lambda_growth: 0.10
+  lambda_max: 2.50
+  tail_weight: 0.70
+  mean_weight: 0.20
+  batch_fraction: 0.25
+
+fixed_protocol:
+  patient_group_required: true
+  test_set_locked_until_selection: true
+  literature_results_separate: true
+  collision_rate_denominator_required: true
+  confidence_interval: student_t_95
+  attack_grid: default_repository_protocol
+
+outputs:
+  checkpoints: experiments/checkpoints/final_multiseed
+  results: experiments/results/final_multiseed
+  figures: experiments/figures/publication
+  tables: experiments/tables/publication
