@@ -5,6 +5,7 @@ from itertools import combinations
 from typing import Callable
 
 import numpy as np
+import torch
 
 from .attacks import ATTACKS
 
@@ -54,11 +55,26 @@ def all_negative_pairs(ids: list[int]) -> list[tuple[int, int]]:
     return list(combinations(ids, 2))
 
 
-def seed_everything(seed: int = 42) -> None:
-    """Seed NumPy and Python's hash ordering where possible."""
+def seed_everything(seed: int = 42, deterministic: bool = True) -> None:
+    """Seed Python, NumPy and PyTorch for reproducible experiments.
+
+    Deterministic kernels are requested where supported. If an operation has no
+    deterministic implementation on a particular backend, PyTorch may still
+    raise an error at execution time; that is preferable to silently claiming
+    reproducibility.
+    """
     import os
     import random
 
+    seed = int(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
