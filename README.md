@@ -65,10 +65,50 @@ DCT, DTCWT, KAZE, contrastive learning, balanced hashing, STE/BEMQ, BCH, chaos a
 ```bash
 python -m pip install -r requirements.txt
 python -m pip install -e .
-python scripts/run_benchmark.py
+python scripts/run_all.py
 ```
 
-Open the notebooks in order from `notebooks/00_research_map.ipynb` through `notebooks/06_ablation_and_publication_figures.ipynb`.
+## Recommended real dataset: NIH ChestX-ray14
+
+For the first full experiment we use **NIH ChestX-ray14**. It contains 112,120 frontal chest X-rays from 30,805 patients and includes 14 thoracic pathology labels. The Kaggle mirror is convenient for local download, while the patient identifier can be used directly as `group_id` to prevent patient-level leakage.
+
+Kaggle authentication:
+
+```powershell
+kaggle auth login
+```
+
+Download, recursively extract nested image archives, read the NIH metadata, match image files, and build a verified manifest automatically:
+
+```powershell
+python scripts\prepare_nih_chestxray14.py
+```
+
+For a smaller pilot before downloading/processing the entire collection:
+
+```powershell
+python scripts\prepare_nih_chestxray14.py --max-images 5000
+```
+
+The resulting manifest is:
+
+```text
+data/manifests/medical_manifest.csv
+```
+
+The NIH-specific preparation script prefers the dataset's standard `train_val_list.txt` and `test_list.txt` files when present and records the actual `Patient ID` as `group_id`. This is preferable to the generic manifest generator, which can only infer grouping when metadata are unavailable.
+
+After preparation:
+
+```powershell
+python scripts\run_all.py --real --limit 200
+```
+
+For publication experiments, do not cap the dataset arbitrarily unless the paper explicitly defines a reproducible subset. Keep the exact manifest, split, preprocessing, seed, hash length, attack grid and configuration used for every reported experiment.
+
+## External validation plan
+
+After the NIH experiment is stable, add **CheXpert** and/or **MIMIC-CXR-JPG** for external validation. These datasets are larger but have different access procedures, so they should not block the main NIH pipeline.
 
 ## Structure
 
@@ -76,15 +116,18 @@ Open the notebooks in order from `notebooks/00_research_map.ipynb` through `note
 zero_watermarking/
 ├── configs/
 ├── data/images/
+├── data/raw/
 ├── experiments/results/
 ├── figures/
 ├── notebooks/
 ├── reports/
 ├── scripts/
+│   ├── prepare_nih_chestxray14.py
+│   └── ...
 ├── src/zero_watermarking/
 └── tests/
 ```
 
 ## Research status
 
-This release establishes the reproducible benchmark and learned-method hand-off. The next scientific step is to run the protocol on the chosen real medical dataset(s), across multiple seeds, with confidence intervals and complete ablation tables.
+The software pipeline and offline CAP-ZW training path are execution-tested locally. Scientific conclusions remain pending real-dataset experiments, multiple seeds, confidence intervals, and the complete ablation/benchmark matrix.
