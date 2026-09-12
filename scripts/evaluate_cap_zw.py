@@ -10,7 +10,7 @@ import torch
 from zero_watermarking.attacks import ATTACKS
 from zero_watermarking.datasets import load_image, load_manifest, validate_manifest
 from zero_watermarking.metrics import bit_balance, bit_entropy, mean_abs_corr, evaluate_hash_bank
-from zero_watermarking.training import CAPZWHashNet
+from zero_watermarking.training import CAP_ZW_VERSION, CAPZWHashNet
 
 
 DEFAULT_ATTACK_GRID = (
@@ -28,13 +28,14 @@ DEFAULT_ATTACK_GRID = (
 )
 
 
-def load_model(checkpoint: Path, bits: int, device: str) -> CAPZWHashNet:
+def load_model(checkpoint: Path, bits: int, device: str) -> tuple[CAPZWHashNet, dict]:
     model = CAPZWHashNet(nbits=bits)
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
     state = payload.get("model", payload)
     model.load_state_dict(state)
     model.to(device).eval()
-    return model
+    metadata = payload if isinstance(payload, dict) else {}
+    return model, metadata
 
 
 def _clean_pair_distances(bank: dict[str, np.ndarray]) -> np.ndarray:
@@ -50,8 +51,18 @@ def _intra_distances(result: dict) -> np.ndarray:
     return np.asarray([float(row[2]) for row in result.get("details", [])], dtype=np.float64)
 
 
+def _resolve_version(metadata: dict) -> str:
+    version = metadata.get("version")
+    if version:
+        return str(version)
+    config = metadata.get("config", {})
+    if isinstance(config, dict) and config.get("version"):
+        return str(config["version"])
+    return "unknown"
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate CAP-ZW on a held-out medical split with collision-tail diagnostics.")
+    parser = argparse.ArgumentParser(description="Evaluate a CAP-ZW checkpoint with collision-tail diagnostics.")
     parser.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
     parser.add_argument("--split", default="test")
     parser.add_argument("--checkpoint", default="experiments/checkpoints/cap_zw.pt")
@@ -78,7 +89,10 @@ def main() -> int:
     checkpoint = Path(args.checkpoint)
     if not checkpoint.exists():
         raise SystemExit(f"Checkpoint not found: {checkpoint}")
-    model = load_model(checkpoint, args.bits, device)
+    model, metadata = load_model(checkpoint, args.bits, device)
+    version = _resolve_version(metadata)
+    if version == "unknown":
+        version = CAP_ZW_VERSION if metadata.get("model") else "unknown"
 
     clean_bank: dict[str, np.ndarray] = {}
     attacked_bank: dict[str, dict[str, np.ndarray]] = {}
@@ -104,7 +118,6 @@ def main() -> int:
 
     inter = _clean_pair_distances(clean_bank)
     intra = _intra_distances(result)
-    # Robust tail separation complements the exact min/max collision gap.
     inter_q05 = float(np.quantile(inter, 0.05)) if inter.size else float("nan")
     inter_q10 = float(np.quantile(inter, 0.10)) if inter.size else float("nan")
     intra_q90 = float(np.quantile(intra, 0.90)) if intra.size else float("nan")
@@ -113,7 +126,7 @@ def main() -> int:
     q10_tail_gap = inter_q10 - intra_q90 if inter.size and intra.size else float("nan")
 
     summary = {
-        "version": "CAP-ZW-v5",
+        "version": version,
         "split": args.split,
         "images": len(clean_bank),
         "bits": args.bits,
@@ -152,7 +165,7 @@ def main() -> int:
     collision_frame = pd.DataFrame(pairs, columns=["image_a", "image_b", "hamming", "exact_collision", "near_collision"])
     collision_frame.to_csv(out / "collision_pairs.csv", index=False)
 
-    exact = int((collision_frame["exact_collision"] == True).sum()) if not collision_frame.empty else 0
+    exact = int(collision_frame["exact_collision"].sum()) if not collision_frame.empty else 0
     near = int(len(collision_frame))
     ultra_near = int((collision_frame["hamming"] <= 0.05).sum()) if not collision_frame.empty else 0
     print(pd.Series(summary).to_string())
