@@ -27,6 +27,9 @@ class TrainConfig:
     nbits: int = 256
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     grad_clip: float = 5.0
+    memory_size: int = 2048
+    mgda_steps: int = 25
+    collision_power: float = 2.0
 
 
 class PairAttackDataset(Dataset):
@@ -86,20 +89,43 @@ def _pairwise_hamming(z: Tensor) -> Tensor:
     return torch.cdist(z, z, p=1) / z.shape[1]
 
 
-def objective_terms(clean: Tensor, attacked: Tensor, labels: Tensor, margin: float) -> Dict[str, Tensor]:
-    """CAP-ZW objectives in normalized hash space [0,1]."""
+def objective_terms(
+    clean: Tensor,
+    attacked: Tensor,
+    labels: Tensor,
+    margin: float,
+    memory_codes: Tensor | None = None,
+    memory_labels: Tensor | None = None,
+    collision_power: float = 2.0,
+) -> Dict[str, Tensor]:
+    """CAP-ZW objectives with cross-batch collision-aware hard-negative mining."""
     robustness = (clean - attacked).abs().mean()
 
     distances = _pairwise_hamming(clean)
     same = labels[:, None].eq(labels[None, :])
     negative = distances.masked_fill(same, float("inf"))
     hard_negative = negative.min(dim=1).values
+
+    if memory_codes is not None and memory_codes.numel() > 0:
+        memory_codes = memory_codes.detach()
+        memory_labels = memory_labels.detach() if memory_labels is not None else None
+        memory_distances = torch.cdist(clean, memory_codes, p=1) / clean.shape[1]
+        if memory_labels is not None:
+            memory_same = labels[:, None].eq(memory_labels[None, :])
+            memory_distances = memory_distances.masked_fill(memory_same, float("inf"))
+        memory_hard = memory_distances.min(dim=1).values
+        hard_negative = torch.minimum(hard_negative, memory_hard)
+
     valid = torch.isfinite(hard_negative)
-    discrimination = (
-        torch.relu(margin - hard_negative[valid]).mean()
-        if valid.any()
+    violation = torch.relu(margin - hard_negative[valid]) if valid.any() else clean.new_zeros(1)
+    # Convex hinge plus a stronger penalty for very small/zero inter-image gaps.
+    discrimination = violation.mean() if violation.numel() else clean.new_tensor(0.0)
+    collision_barrier = (
+        (violation.clamp_min(0.0).pow(collision_power)).mean()
+        if violation.numel()
         else clean.new_tensor(0.0)
     )
+    discrimination = discrimination + 0.5 * collision_barrier
 
     p = clean.mean(dim=0).clamp(1e-5, 1.0 - 1e-5)
     balance = (p - 0.5).pow(2).mean()
@@ -127,7 +153,6 @@ def _flatten_gradients(grads: list[Tensor | None], params: list[Tensor]) -> Tens
 
 
 def _project_simplex(x: Tensor) -> Tensor:
-    """Euclidean projection onto the probability simplex."""
     if x.numel() == 1:
         return torch.ones_like(x)
     u, _ = torch.sort(x, descending=True)
@@ -140,12 +165,7 @@ def _project_simplex(x: Tensor) -> Tensor:
 
 
 def mgda_weights(losses: list[Tensor], model: nn.Module, steps: int = 25) -> Tensor:
-    """Compute a minimum-norm multi-gradient simplex weighting.
-
-    The task weights solve min ||sum_i w_i g_i||^2 subject to w >= 0 and sum(w)=1.
-    Projected gradient descent on the task Gram matrix gives a deterministic,
-    lightweight MGDA-style solver without adding an external dependency.
-    """
+    """Minimum-norm multi-gradient simplex weighting."""
     if not losses:
         raise ValueError("losses must not be empty")
     params = [p for p in model.parameters() if p.requires_grad]
@@ -164,19 +184,36 @@ def mgda_weights(losses: list[Tensor], model: nn.Module, steps: int = 25) -> Ten
     return weights.detach()
 
 
+def _update_memory(
+    memory_codes: Tensor,
+    memory_labels: Tensor,
+    new_codes: Tensor,
+    new_labels: Tensor,
+    max_size: int,
+) -> tuple[Tensor, Tensor]:
+    if max_size <= 0:
+        return memory_codes[:0], memory_labels[:0]
+    codes = torch.cat([memory_codes, new_codes.detach()], dim=0)
+    labels = torch.cat([memory_labels, new_labels.detach()], dim=0)
+    if codes.shape[0] > max_size:
+        codes = codes[-max_size:]
+        labels = labels[-max_size:]
+    return codes, labels
+
+
 def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str | None = None):
-    """Train CAP-ZW using collision-aware objectives and MGDA task balancing."""
+    """Train CAP-ZW with cross-batch memory mining and MGDA task balancing."""
     device = torch.device(config.device)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
     history: list[dict[str, float]] = []
-
     task_names = ["robustness", "discrimination", "balance", "decorrelation", "entropy_penalty"]
-    totals_keys = task_names + ["total"]
+    memory_codes = torch.empty((0, config.nbits), dtype=torch.float32, device=device)
+    memory_labels = torch.empty((0,), dtype=torch.long, device=device)
 
     for epoch in range(config.epochs):
         model.train()
-        totals = {key: 0.0 for key in totals_keys}
+        totals = {key: 0.0 for key in task_names + ["total", "memory_size"]}
         weight_totals = np.zeros(len(task_names), dtype=np.float64)
         batches = 0
 
@@ -186,20 +223,21 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
             attacked_x = attacked_x.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            # BEMQ(hard=False) already returns probabilities; avoid a second sigmoid.
             clean = model(clean_x, hard=False)
             attacked = model(attacked_x, hard=False)
-            terms = objective_terms(clean, attacked, labels, config.margin)
+            terms = objective_terms(
+                clean,
+                attacked,
+                labels,
+                config.margin,
+                memory_codes=memory_codes,
+                memory_labels=memory_labels,
+                collision_power=config.collision_power,
+            )
             tasks = [terms[name] for name in task_names]
-            mgda = mgda_weights(tasks, model)
+            mgda = mgda_weights(tasks, model, steps=config.mgda_steps)
             scale = torch.tensor(
-                [
-                    config.lambda_robust,
-                    config.lambda_collision,
-                    config.lambda_balance,
-                    config.lambda_corr,
-                    config.lambda_entropy,
-                ],
+                [config.lambda_robust, config.lambda_collision, config.lambda_balance, config.lambda_corr, config.lambda_entropy],
                 dtype=mgda.dtype,
                 device=device,
             )
@@ -212,9 +250,11 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
 
+            memory_codes, memory_labels = _update_memory(memory_codes, memory_labels, clean, labels, config.memory_size)
             for key, value in terms.items():
                 totals[key] += float(value.detach())
             totals["total"] += float(loss.detach())
+            totals["memory_size"] += float(memory_codes.shape[0])
             weight_totals += effective.detach().cpu().numpy()
             batches += 1
 
@@ -241,7 +281,7 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
 
 
 class CAPZWHashNet(HashEncoder):
-    """Publication experiment model: BEMQ + collision-aware Pareto objectives."""
+    """CAP-ZW v3: BEMQ encoder + cross-batch collision memory + MGDA."""
 
     def __init__(self, nbits: int = 256, base_channels: int = 32):
         super().__init__(nbits=nbits, base_channels=base_channels, use_bemq=True)
