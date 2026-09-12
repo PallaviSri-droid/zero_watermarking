@@ -4,10 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zero-watermarking"
-version = "0.1.0"
-description = "Collision-aware Pareto benchmark for medical-image zero-watermarking"
+version = "0.2.0"
+description = "Collision-aware Pareto benchmark and reproducible pipeline for medical-image zero-watermarking"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "scipy>=1.11",
+  "scikit-image>=0.22",
+  "opencv-python>=4.9",
+  "matplotlib>=3.8",
+  "seaborn>=0.13",
+  "scikit-learn>=1.4",
+  "Pillow>=10.2",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+  "torch>=2.2",
+  "torchvision>=0.17",
+]
+
+[project.optional-dependencies]
+research = [
+  "jupyter>=1.0",
+  "ipykernel>=6.29",
+  "dtcwt>=0.14",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
