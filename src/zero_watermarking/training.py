@@ -14,6 +14,9 @@ from .attacks import ATTACKS
 from .learned import HashEncoder
 
 
+CAP_ZW_VERSION = "CAP-ZW-v7"
+
+
 @dataclass
 class TrainConfig:
     epochs: int = 20
@@ -23,14 +26,14 @@ class TrainConfig:
     margin: float = 0.38
     robust_target: float = 0.022
     robust_softness: float = 0.01
-    lambda_robust: float = 1.35
-    lambda_tail: float = 0.85
-    lambda_diversity: float = 0.45
-    lambda_balance: float = 0.30
-    lambda_corr: float = 0.12
-    lambda_entropy: float = 0.12
-    lambda_uniformity: float = 0.18
-    lambda_consistency: float = 0.65
+    lambda_robust: float = 1.50
+    lambda_tail: float = 0.70
+    lambda_diversity: float = 0.35
+    lambda_balance: float = 0.28
+    lambda_corr: float = 0.10
+    lambda_entropy: float = 0.10
+    lambda_uniformity: float = 0.12
+    lambda_consistency: float = 0.90
     nbits: int = 256
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     grad_clip: float = 5.0
@@ -39,15 +42,15 @@ class TrainConfig:
     mgda_steps: int = 20
     collision_power: float = 2.0
     topk_negatives: int = 8
-    diversity_target: float = 0.40
-    tail_target: float = 0.30
+    diversity_target: float = 0.36
+    tail_target: float = 0.28
     uniformity_temperature: float = 0.08
     robustness_quantile: float = 0.80
     attack_views: int = 3
 
 
 class PairAttackDataset(Dataset):
-    """Deterministic multi-view clean/attacked pairs for reproducible training."""
+    """Deterministic multi-view dataset: every source image is exposed to attack_views attacks."""
 
     def __init__(
         self,
@@ -70,10 +73,11 @@ class PairAttackDataset(Dataset):
         self.attack_views = max(1, int(attack_views))
 
     def __len__(self) -> int:
-        return int(len(self.images))
+        return int(len(self.images) * self.attack_views)
 
     def _attack(self, clean: np.ndarray, index: int, view: int) -> np.ndarray:
-        name = self.attack_names[(index * self.attack_views + view) % len(self.attack_names)]
+        attack_index = (index + view) % len(self.attack_names)
+        name = self.attack_names[attack_index]
         seed = index * 97 + view
         defaults = {
             "gaussian_noise": {"sigma": 0.03 + 0.01 * (view % 2), "seed": seed},
@@ -91,14 +95,14 @@ class PairAttackDataset(Dataset):
         return ATTACKS[name](clean, **defaults.get(name, {}))
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor, str]:
-        clean = self.images[index]
-        view = index % self.attack_views
-        attack_name = self.attack_names[(index * self.attack_views + view) % len(self.attack_names)]
-        attacked = self._attack(clean, index, view)
+        base_index, view = divmod(index, self.attack_views)
+        clean = self.images[base_index]
+        attack_name = self.attack_names[(base_index + view) % len(self.attack_names)]
+        attacked = self._attack(clean, base_index, view)
         return (
             torch.from_numpy(clean[None]),
             torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None]),
-            torch.tensor(int(self.labels[index]), dtype=torch.long),
+            torch.tensor(int(self.labels[base_index]), dtype=torch.long),
             attack_name,
         )
 
@@ -107,7 +111,9 @@ def _normalized_hamming(z1: Tensor, z2: Tensor) -> Tensor:
     return torch.cdist(z1, z2, p=1) / z1.shape[1]
 
 
-def _finite_topk(values: Tensor, k: int) -> list[Tensor]:
+def _finite_topk(values: Tensor | None, k: int) -> list[Tensor]:
+    if values is None or values.numel() == 0:
+        return []
     rows: list[Tensor] = []
     for row in values:
         finite = row[torch.isfinite(row)]
@@ -120,39 +126,38 @@ def _finite_topk(values: Tensor, k: int) -> list[Tensor]:
 
 
 def _soft_negative_loss(distances: Tensor | None, margin: float, topk: int, temperature: float, device: torch.device) -> Tensor:
-    if distances is None or distances.numel() == 0:
-        return torch.zeros((), device=device)
     rows = _finite_topk(distances, topk)
+    if not rows:
+        return torch.zeros((), device=device)
     tau = max(float(temperature), 1e-4)
-    return torch.stack([F.softplus((float(margin) - r) / tau).mul(tau).mean() for r in rows]).mean()
+    return torch.stack([F.softplus((float(margin) - row) / tau).mul(tau).mean() for row in rows]).mean()
 
 
 def _tail_collision_loss(distances: Tensor | None, target: float, topk: int, power: float, device: torch.device) -> Tensor:
-    if distances is None or distances.numel() == 0:
-        return torch.zeros((), device=device)
     rows = _finite_topk(distances, topk)
-    penalties = [F.relu(float(target) - r.min()).pow(max(float(power), 1.0)) for r in rows]
+    if not rows:
+        return torch.zeros((), device=device)
+    penalties = [F.relu(float(target) - row.min()).pow(max(float(power), 1.0)) for row in rows]
     return torch.stack(penalties).mean()
 
 
 def _uniformity_loss(distances: Tensor | None, temperature: float, topk: int, device: torch.device) -> Tensor:
-    if distances is None or distances.numel() == 0:
-        return torch.zeros((), device=device)
     rows = _finite_topk(distances, topk)
+    if not rows:
+        return torch.zeros((), device=device)
     tau = max(float(temperature), 1e-4)
-    return torch.stack([torch.exp(-r / tau).mean() for r in rows]).mean()
+    return torch.stack([torch.exp(-row / tau).mean() for row in rows]).mean()
 
 
 def _robust_floor_loss(clean: Tensor, attacked: Tensor, target: float, softness: float) -> Tensor:
     per_sample = (clean - attacked).abs().mean(dim=1)
-    target_t = clean.new_tensor(float(target))
     beta = max(float(softness), 1e-4)
+    target_t = clean.new_tensor(float(target))
+    # Constraint-style barrier: once the target is met, this term becomes small.
     return F.softplus((per_sample - target_t) / beta).mul(beta).mean()
 
 
 def _consistency_loss(clean: Tensor, attacked: Tensor) -> Tensor:
-    # Symmetric bitwise consistency keeps clean/attacked views aligned without forcing every
-    # representation toward an all-zero/all-one solution.
     p = clean.clamp(1e-5, 1.0 - 1e-5)
     q = attacked.clamp(1e-5, 1.0 - 1e-5)
     kl_pq = p * (torch.log(p) - torch.log(q)) + (1.0 - p) * (torch.log1p(-p) - torch.log1p(-q))
@@ -169,28 +174,34 @@ def objective_terms(
     memory_labels: Tensor | None = None,
     collision_power: float = 2.0,
     topk_negatives: int = 8,
-    diversity_target: float = 0.40,
-    tail_target: float = 0.30,
+    diversity_target: float = 0.36,
+    tail_target: float = 0.28,
     uniformity_temperature: float = 0.08,
     robustness_quantile: float = 0.80,
     robust_target: float = 0.022,
     robust_softness: float = 0.01,
 ) -> Dict[str, Tensor]:
-    """CAP-ZW v6: constrained robustness + tail-aware collision optimization."""
+    """CAP-ZW v7: robustness-constrained multi-view hashing with controlled collision pressure."""
     if clean.ndim != 2 or attacked.ndim != 2 or clean.shape != attacked.shape:
         raise ValueError("clean and attacked must both have shape [B, nbits]")
 
+    device = clean.device
     pair_codes = torch.cat([clean, attacked], dim=0)
     pair_labels = torch.cat([labels, labels], dim=0)
 
     per_sample_robust = (clean - attacked).abs().mean(dim=1)
     q = float(min(max(robustness_quantile, 0.5), 1.0))
     q_value = torch.quantile(per_sample_robust.detach(), q)
-    robust_weights = torch.sigmoid((per_sample_robust - q_value) / 0.012) + 0.30
-    tail_weighted = (per_sample_robust * robust_weights).mean() / robust_weights.mean().clamp_min(1e-6)
+    robust_weights = torch.sigmoid((per_sample_robust - q_value) / 0.012) + 0.50
     floor = _robust_floor_loss(clean, attacked, robust_target, robust_softness)
-    robustness = tail_weighted + 0.75 * floor
+    tail_weighted = (per_sample_robust * robust_weights).mean() / robust_weights.mean().clamp_min(1e-6)
+    robustness = tail_weighted + 0.50 * floor
     consistency = _consistency_loss(clean, attacked)
+
+    # Gate collision pressure when the robustness constraint is being violated.
+    violation = F.relu(per_sample_robust.detach().mean() - float(robust_target))
+    collision_gate = torch.sigmoid(-violation / max(float(robust_softness), 1e-4))
+    collision_gate = collision_gate.detach().clamp(0.20, 1.0)
 
     distances = _normalized_hamming(pair_codes, pair_codes)
     same = pair_labels[:, None].eq(pair_labels[None, :])
@@ -202,22 +213,24 @@ def objective_terms(
         if memory_labels is not None:
             memory_neg = memory_neg.masked_fill(pair_labels[:, None].eq(memory_labels.detach()[None, :]), float("inf"))
 
-    soft_batch = _soft_negative_loss(pair_neg, margin, topk_negatives, uniformity_temperature, clean.device)
-    soft_memory = _soft_negative_loss(memory_neg, margin, topk_negatives, uniformity_temperature, clean.device) if memory_neg is not None else torch.zeros((), device=clean.device)
-    discrimination = (soft_batch + soft_memory) / (2.0 if memory_neg is not None else 1.0)
+    soft_batch = _soft_negative_loss(pair_neg, margin, topk_negatives, uniformity_temperature, device)
+    soft_memory = _soft_negative_loss(memory_neg, margin, topk_negatives, uniformity_temperature, device)
+    discrimination = collision_gate * ((soft_batch + soft_memory) / (2.0 if memory_neg is not None else 1.0))
 
-    batch_tail = _tail_collision_loss(pair_neg, tail_target, topk_negatives, collision_power, clean.device)
-    memory_tail = _tail_collision_loss(memory_neg, tail_target, topk_negatives, collision_power, clean.device) if memory_neg is not None else torch.zeros((), device=clean.device)
-    tail_collision = (batch_tail + memory_tail) / (2.0 if memory_neg is not None else 1.0) + 0.15 * discrimination
+    batch_tail = _tail_collision_loss(pair_neg, tail_target, topk_negatives, collision_power, device)
+    memory_tail = _tail_collision_loss(memory_neg, tail_target, topk_negatives, collision_power, device)
+    tail_collision = collision_gate * ((batch_tail + memory_tail) / (2.0 if memory_neg is not None else 1.0) + 0.10 * discrimination)
 
     cross_min = pair_neg.min(dim=1).values
     if memory_neg is not None:
         cross_min = torch.minimum(cross_min, memory_neg.min(dim=1).values)
     valid = torch.isfinite(cross_min)
-    diversity = F.relu(float(diversity_target) - cross_min[valid]).pow(2).mean() if valid.any() else torch.zeros((), device=clean.device)
+    diversity = F.relu(float(diversity_target) - cross_min[valid]).pow(2).mean() if valid.any() else torch.zeros((), device=device)
+    diversity = collision_gate * diversity
 
     sources = [pair_neg] + ([memory_neg] if memory_neg is not None else [])
-    uniformity = torch.stack([_uniformity_loss(s, uniformity_temperature, topk_negatives, clean.device) for s in sources]).mean()
+    uniformity = torch.stack([_uniformity_loss(source, uniformity_temperature, topk_negatives, device) for source in sources]).mean()
+    uniformity = collision_gate * uniformity
 
     combined = torch.cat([clean, attacked], dim=0)
     p = combined.mean(dim=0).clamp(1e-5, 1.0 - 1e-5)
@@ -228,7 +241,7 @@ def objective_terms(
     std = centered.std(dim=0, unbiased=False).clamp_min(2e-3)
     normalized = centered / std
     corr_mat = (normalized.T @ normalized) / max(combined.shape[0], 1)
-    eye = torch.eye(corr_mat.shape[0], device=combined.device, dtype=combined.dtype)
+    eye = torch.eye(corr_mat.shape[0], device=device, dtype=combined.dtype)
     decorrelation = ((corr_mat - eye) * (1.0 - eye)).pow(2).mean()
 
     return {
@@ -244,7 +257,10 @@ def objective_terms(
 
 
 def _flatten_gradients(grads: list[Tensor | None], params: list[Tensor]) -> Tensor:
-    return torch.cat([torch.zeros_like(param).reshape(-1) if grad is None else grad.reshape(-1) for grad, param in zip(grads, params)])
+    return torch.cat([
+        torch.zeros_like(param).reshape(-1) if grad is None else grad.reshape(-1)
+        for grad, param in zip(grads, params)
+    ])
 
 
 def _project_simplex(x: Tensor) -> Tensor:
@@ -265,9 +281,6 @@ def mgda_weights(losses: list[Tensor], model: nn.Module, steps: int = 20) -> Ten
     params = [p for p in model.parameters() if p.requires_grad]
     vectors = []
     for loss in losses:
-        if not torch.isfinite(loss.detach()):
-            vectors.append(torch.zeros(sum(p.numel() for p in params), device=loss.device, dtype=loss.dtype))
-            continue
         grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
         vectors.append(_flatten_gradients(grads, params))
     G = torch.stack(vectors, dim=1)
@@ -281,7 +294,13 @@ def mgda_weights(losses: list[Tensor], model: nn.Module, steps: int = 20) -> Ten
     return weights.detach()
 
 
-def _update_memory(memory_codes: Tensor, memory_labels: Tensor, new_codes: Tensor, new_labels: Tensor, max_size: int):
+def _update_memory(
+    memory_codes: Tensor,
+    memory_labels: Tensor,
+    new_codes: Tensor,
+    new_labels: Tensor,
+    max_size: int,
+) -> tuple[Tensor, Tensor]:
     if max_size <= 0:
         return memory_codes[:0], memory_labels[:0]
     codes = torch.cat([memory_codes, new_codes.detach()], dim=0)
@@ -293,30 +312,37 @@ def _update_memory(memory_codes: Tensor, memory_labels: Tensor, new_codes: Tenso
 
 
 def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str | None = None):
-    """Train CAP-ZW v6 with robustness-constrained tail collision optimization."""
+    """Train CAP-ZW v7 with explicit robustness constraint and gated collision optimization."""
     device = torch.device(config.device)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     history: list[dict[str, float]] = []
-    task_names = ["robustness", "tail_collision", "diversity", "balance", "decorrelation", "entropy_penalty", "uniformity", "consistency"]
+    task_names = [
+        "robustness", "tail_collision", "diversity", "balance",
+        "decorrelation", "entropy_penalty", "uniformity", "consistency",
+    ]
     memory_codes = torch.empty((0, config.nbits), dtype=torch.float32, device=device)
     memory_labels = torch.empty((0,), dtype=torch.long, device=device)
 
     for epoch in range(config.epochs):
         model.train()
-        totals = {key: 0.0 for key in task_names + ["total", "memory_size", "active_margin", "active_tail", "active_diversity", "robust_target", "progress"]}
+        totals = {key: 0.0 for key in task_names + ["total", "memory_size", "active_margin", "active_tail", "active_diversity", "robust_target", "collision_gate", "progress"]}
         weight_totals = np.zeros(len(task_names), dtype=np.float64)
         batches = 0
+
         for batch in loader:
             clean_x, attacked_x, labels = batch[:3]
-            clean_x, attacked_x, labels = clean_x.to(device, non_blocking=True), attacked_x.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            clean_x = clean_x.to(device, non_blocking=True)
+            attacked_x = attacked_x.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             clean, attacked = model(clean_x, hard=False), model(attacked_x, hard=False)
 
             progress = min(1.0, memory_codes.shape[0] / max(config.memory_warmup, 1))
             schedule = min(1.0, (epoch + 1) / max(config.epochs * 0.6, 1.0))
-            active_margin = 0.22 + (float(config.margin) - 0.22) * schedule
-            active_tail = 0.18 + (float(config.tail_target) - 0.18) * schedule
-            active_diversity = 0.24 + (float(config.diversity_target) - 0.24) * schedule
+            active_margin = 0.20 + (float(config.margin) - 0.20) * schedule
+            active_tail = 0.16 + (float(config.tail_target) - 0.16) * schedule
+            active_diversity = 0.22 + (float(config.diversity_target) - 0.22) * schedule
+
             terms = objective_terms(
                 clean,
                 attacked,
@@ -347,12 +373,14 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
             ], dtype=mgda.dtype, device=device)
             effective = mgda * scale
             effective = effective / effective.sum().clamp_min(1e-12)
-            loss = sum(w * t for w, t in zip(effective, tasks))
+            loss = sum(weight * task for weight, task in zip(effective, tasks))
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
+
+            # Store clean codes only after the optimizer step; memory is detached by construction.
             memory_codes, memory_labels = _update_memory(memory_codes, memory_labels, clean, labels, config.memory_size)
 
             for key, value in terms.items():
@@ -364,6 +392,7 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
             totals["active_diversity"] += active_diversity
             totals["robust_target"] += config.robust_target
             totals["progress"] += progress
+            totals["collision_gate"] += float(torch.sigmoid(-(F.relu((clean - attacked).abs().mean().detach() - config.robust_target)) / max(config.robust_softness, 1e-4)).clamp(0.20, 1.0))
             weight_totals += effective.detach().cpu().numpy()
             batches += 1
 
@@ -382,13 +411,13 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
                 "optimizer": optimizer.state_dict(),
                 "history": history,
                 "config": config.__dict__,
-                "version": "CAP-ZW-v6",
+                "version": CAP_ZW_VERSION,
             }, path)
     return history
 
 
 class CAPZWHashNet(HashEncoder):
-    """CAP-ZW v6: BEMQ encoder with robustness constraint and tail-aware collision control."""
+    """CAP-ZW v7: BEMQ encoder with robustness-constrained collision control."""
 
     def __init__(self, nbits: int = 256, base_channels: int = 32):
         super().__init__(nbits=nbits, base_channels=base_channels, use_bemq=True)
