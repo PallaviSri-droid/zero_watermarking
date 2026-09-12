@@ -37,11 +37,7 @@ def bit_entropy(bits: np.ndarray):
 
 
 def mean_abs_corr(bits: np.ndarray) -> float:
-    """Mean absolute pairwise bit correlation, ignoring constant columns.
-
-    Constant hash bits have undefined Pearson correlation. They are excluded
-    rather than passing NaNs into publication tables or emitting NumPy warnings.
-    """
+    """Mean absolute pairwise bit correlation, ignoring constant columns."""
     b = np.asarray(bits).astype(float)
     if b.ndim != 2 or b.shape[0] < 2 or b.shape[1] < 2:
         return 0.0
@@ -71,14 +67,44 @@ def roc_stats(genuine_scores, impostor_scores):
     fnr = 1 - tpr
     i = int(np.nanargmin(np.abs(fpr - fnr)))
     eer = float((fpr[i] + fnr[i]) / 2)
-    return {
-        "auc": auc,
-        "eer": eer,
-        "fpr": fpr,
-        "tpr": tpr,
-        "fnr": fnr,
-        "thresholds": thresholds,
+    return {"auc": auc, "eer": eer, "fpr": fpr, "tpr": tpr, "fnr": fnr, "thresholds": thresholds}
+
+
+def collision_statistics(inter: np.ndarray, intra: np.ndarray, thresholds=(0.05, 0.10)) -> dict[str, float | int]:
+    """Report collision risk using pair-normalized rates and tail separation.
+
+    Rates are per 10,000 negative image pairs.  Unlike the raw minimum-distance
+    gap, these statistics remain interpretable when the evaluation set changes.
+    """
+    inter = np.asarray(inter, dtype=np.float64).ravel()
+    intra = np.asarray(intra, dtype=np.float64).ravel()
+    if inter.size == 0:
+        raise ValueError("inter-image distances are required")
+    if intra.size == 0:
+        raise ValueError("intra-image distances are required")
+    total = float(inter.size)
+    exact = int(np.count_nonzero(inter == 0.0))
+    result: dict[str, float | int] = {
+        "negative_pairs": int(inter.size),
+        "exact_collision_pairs": exact,
+        "exact_collision_rate_per_10k": exact / total * 10000.0,
+        "min_inter_hd": float(inter.min()),
+        "mean_inter_hd": float(inter.mean()),
+        "inter_q01": float(np.quantile(inter, 0.01)),
+        "inter_q05": float(np.quantile(inter, 0.05)),
+        "inter_q10": float(np.quantile(inter, 0.10)),
+        "intra_q90": float(np.quantile(intra, 0.90)),
+        "intra_q95": float(np.quantile(intra, 0.95)),
+        "collision_gap": float(inter.min() - intra.max()),
+        "q05_tail_gap": float(np.quantile(inter, 0.05) - np.quantile(intra, 0.95)),
+        "q10_tail_gap": float(np.quantile(inter, 0.10) - np.quantile(intra, 0.90)),
     }
+    for threshold in thresholds:
+        tag = f"{threshold:.2f}".replace(".", "p")
+        count = int(np.count_nonzero(inter <= threshold))
+        result[f"collision_pairs_le_{threshold:.2f}"] = count
+        result[f"collision_rate_le_{threshold:.2f}_per_10k"] = count / total * 10000.0
+    return result
 
 
 def evaluate_hash_bank(clean_bank, attacked_bank):
@@ -102,16 +128,17 @@ def evaluate_hash_bank(clean_bank, attacked_bank):
     genuine_scores = [1.0 - x for x in intra]
     impostor_scores = [1.0 - x for x in inter]
     rs = roc_stats(genuine_scores, impostor_scores)
-    collision_gap = min(inter) - max(intra)
+    stats = collision_statistics(np.asarray(inter), np.asarray(intra))
     return {
         "mean_intra_hd": float(np.mean(intra)),
         "max_intra_hd": float(np.max(intra)),
         "mean_ber": float(np.mean(intra)),
         "mean_nc": float(np.mean(genuine_nc)),
-        "min_inter_hd": float(np.min(inter)),
-        "mean_inter_hd": float(np.mean(inter)),
-        "collision_gap": float(collision_gap),
+        "min_inter_hd": stats["min_inter_hd"],
+        "mean_inter_hd": stats["mean_inter_hd"],
+        "collision_gap": stats["collision_gap"],
         "auc": rs["auc"],
         "eer": rs["eer"],
+        "collision_statistics": stats,
         "details": rows,
     }
