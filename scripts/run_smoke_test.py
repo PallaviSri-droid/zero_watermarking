@@ -14,17 +14,17 @@ from zero_watermarking.watermark import create_zero_watermark, recover_watermark
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a complete offline smoke test without a medical dataset.")
+    parser = argparse.ArgumentParser(description="Run a complete offline execution smoke test.")
     parser.add_argument("--images", type=int, default=12)
-    parser.add_argument("--size", type=int, default=128)
-    parser.add_argument("--bits", type=int, default=128)
+    parser.add_argument("--size", type=int, default=64)
+    parser.add_argument("--bits", type=int, default=64)
     parser.add_argument("--out", default="experiments/results/smoke")
     args = parser.parse_args()
+    if args.images < 4:
+        raise SystemExit("--images must be at least 4 for the training and collision smoke test.")
 
     images = make_dataset(args.images, args.size)
     assert len(images) == args.images
-
-    # Classical representation + watermark registration/recovery.
     hashes = [transform_binary_hash(images[i], args.bits, "dct") for i in sorted(images)]
     bank = np.stack(hashes)
     entropy, _ = bit_entropy(bank)
@@ -39,15 +39,30 @@ def main() -> int:
     assert normalized_correlation(owner, recovered) > 0.99
     assert hamming(owner, recovered) == 0.0
 
-    # Neural model shape/gradient smoke test.
     import torch
+    from torch.utils.data import DataLoader
+    from zero_watermarking.training import CAPZWHashNet, PairAttackDataset, TrainConfig, train_cap_zw
+
+    torch.manual_seed(42)
     model = HashEncoder(nbits=args.bits)
     x = torch.from_numpy(images[0][None, None].astype(np.float32))
     logits = model(x, hard=False)
     assert logits.shape == (1, args.bits)
     logits.sum().backward()
 
-    # Full classical benchmark and artifact creation.
+    train_images = np.stack([images[i] for i in sorted(images)])
+    labels = np.arange(len(train_images), dtype=np.int64)
+    loader = DataLoader(PairAttackDataset(train_images, labels), batch_size=4, shuffle=False, num_workers=0)
+    train_model = CAPZWHashNet(nbits=args.bits)
+    history = train_cap_zw(
+        train_model,
+        loader,
+        TrainConfig(epochs=1, batch_size=4, nbits=args.bits, device="cpu"),
+        checkpoint=str(Path(args.out) / "cap_zw_smoke.pt"),
+    )
+    assert len(history) == 1
+    assert Path(args.out, "cap_zw_smoke.pt").exists()
+
     frame = run_benchmark(
         n_images=args.images,
         image_size=args.size,
@@ -57,7 +72,6 @@ def main() -> int:
     )
     assert not frame.empty
     assert Path(args.out, "benchmark_summary.csv").exists()
-
     print("SMOKE TEST PASSED")
     print(f"methods={len(frame)} images={args.images} bits={args.bits} entropy={entropy:.4f} balance_error={balance:.4f}")
     return 0
