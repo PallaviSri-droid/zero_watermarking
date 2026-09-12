@@ -4,9 +4,22 @@ __pycache__/
 .venv/
 .env
 .DS_Store
-experiments/results/*.csv
-experiments/results/*.json
+
+# Experiment outputs and checkpoints
+experiments/
+!experiments/.gitkeep
+
+# Generated Python packaging metadata
+src/zero_watermarking.egg-info/
+
+# Local medical dataset and generated manifests
+data/raw/
+data/manifests/*.csv
+
+# Generated figures / reports
 figures/*.png
 figures/*.svg
+
+# Local image workspace
 data/images/*
 !data/images/.gitkeep
