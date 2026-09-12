@@ -26,10 +26,10 @@ def main() -> int:
     parser.add_argument("--bits", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=6e-4)
-    parser.add_argument("--margin", type=float, default=0.38)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--margin", type=float, default=0.36)
     parser.add_argument("--robust-target", type=float, default=0.022)
-    parser.add_argument("--robust-softness", type=float, default=0.01)
+    parser.add_argument("--robust-softness", type=float, default=0.008)
     parser.add_argument("--robustness-quantile", type=float, default=0.80)
     parser.add_argument("--attack-views", type=int, default=3)
     parser.add_argument("--memory-size", type=int, default=2048)
@@ -37,7 +37,8 @@ def main() -> int:
     parser.add_argument("--mgda-steps", type=int, default=20)
     parser.add_argument("--topk-negatives", type=int, default=8)
     parser.add_argument("--diversity-target", type=float, default=0.36)
-    parser.add_argument("--tail-target", type=float, default=0.28)
+    parser.add_argument("--tail-target", type=float, default=0.26)
+    parser.add_argument("--binary-collision-target", type=float, default=0.125, help="Minimum normalized Hamming distance for thresholded-code negatives.")
     parser.add_argument("--temperature", type=float, default=0.08)
     parser.add_argument("--collision-power", type=float, default=2.0)
     parser.add_argument("--checkpoint", default="experiments/checkpoints/cap_zw.pt")
@@ -81,6 +82,7 @@ def main() -> int:
         topk_negatives=args.topk_negatives,
         diversity_target=args.diversity_target,
         tail_target=args.tail_target,
+        binary_collision_target=args.binary_collision_target,
         uniformity_temperature=args.temperature,
         collision_power=args.collision_power,
         nbits=args.bits,
@@ -96,7 +98,7 @@ def main() -> int:
     print(f"Training complete: epochs={len(history)} images={len(images)} effective_samples={len(dataset)} bits={args.bits} device={device}")
     print(f"version={CAP_ZW_VERSION} memory_size={args.memory_size} warmup={args.memory_warmup} topk={args.topk_negatives}")
     print(f"margin={args.margin} robust_target={args.robust_target} tail_target={args.tail_target} diversity_target={args.diversity_target}")
-    print(f"temperature={args.temperature} robustness_quantile={args.robustness_quantile} attack_views={args.attack_views} mgda_steps={args.mgda_steps}")
+    print(f"binary_collision_target={args.binary_collision_target} temperature={args.temperature} robustness_quantile={args.robustness_quantile} attack_views={args.attack_views} mgda_steps={args.mgda_steps}")
     print(f"checkpoint={Path(args.checkpoint).resolve()}")
     print(f"history={history_path.resolve()}")
     return 0
