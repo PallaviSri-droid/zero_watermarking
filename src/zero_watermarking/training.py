@@ -20,27 +20,27 @@ class TrainConfig:
     lr: float = 1e-3
     margin: float = 0.30
     lambda_robust: float = 1.0
-    lambda_collision: float = 1.0
-    lambda_balance: float = 0.10
-    lambda_corr: float = 0.05
-    lambda_entropy: float = 0.05
+    lambda_collision: float = 0.7
+    lambda_balance: float = 0.30
+    lambda_corr: float = 0.15
+    lambda_entropy: float = 0.15
+    lambda_diversity: float = 0.30
     nbits: int = 256
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     grad_clip: float = 5.0
     memory_size: int = 2048
+    memory_warmup: int = 256
     mgda_steps: int = 25
     collision_power: float = 2.0
+    topk_negatives: int = 8
+    diversity_target: float = 0.22
+    temperature: float = 0.08
 
 
 class PairAttackDataset(Dataset):
     """Deterministic clean/attacked pairs for reproducible multi-attack training."""
 
-    def __init__(
-        self,
-        images: np.ndarray,
-        labels: np.ndarray,
-        attack_names: Iterable[str] = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compound"),
-    ) -> None:
+    def __init__(self, images: np.ndarray, labels: np.ndarray, attack_names: Iterable[str] = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compound")) -> None:
         images = np.asarray(images, dtype=np.float32)
         labels = np.asarray(labels)
         if images.ndim != 3:
@@ -77,79 +77,79 @@ class PairAttackDataset(Dataset):
         clean = self.images[index]
         attack_name = self.attack_names[index % len(self.attack_names)]
         attacked = self._attack(clean, index)
-        return (
-            torch.from_numpy(clean[None]),
-            torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None]),
-            torch.tensor(int(self.labels[index]), dtype=torch.long),
-            attack_name,
-        )
+        return (torch.from_numpy(clean[None]), torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None]), torch.tensor(int(self.labels[index]), dtype=torch.long), attack_name)
 
 
 def _pairwise_hamming(z: Tensor) -> Tensor:
     return torch.cdist(z, z, p=1) / z.shape[1]
 
 
-def objective_terms(
-    clean: Tensor,
-    attacked: Tensor,
-    labels: Tensor,
-    margin: float,
-    memory_codes: Tensor | None = None,
-    memory_labels: Tensor | None = None,
-    collision_power: float = 2.0,
-) -> Dict[str, Tensor]:
-    """CAP-ZW objectives with cross-batch collision-aware hard-negative mining."""
+def _soft_negative_loss(distances: Tensor, margin: float, topk: int, temperature: float) -> Tensor:
+    if distances.numel() == 0:
+        return distances.new_tensor(0.0)
+    finite_rows = torch.isfinite(distances).any(dim=1)
+    if not finite_rows.any():
+        return distances.new_tensor(0.0)
+    distances = distances[finite_rows]
+    distances = torch.where(torch.isfinite(distances), distances, torch.full_like(distances, 1.0))
+    k = min(max(int(topk), 1), distances.shape[1])
+    values = torch.topk(distances, k=k, dim=1, largest=False).values
+    tau = max(float(temperature), 1e-4)
+    # Softplus gives non-zero gradients even for moderately separated pairs.
+    return (torch.nn.functional.softplus((margin - values) / tau) * tau).mean()
+
+
+def objective_terms(clean: Tensor, attacked: Tensor, labels: Tensor, margin: float, memory_codes: Tensor | None = None, memory_labels: Tensor | None = None, collision_power: float = 2.0, topk_negatives: int = 8, diversity_target: float = 0.22, temperature: float = 0.08) -> Dict[str, Tensor]:
+    """Balanced collision-memory objective.
+
+    The loss deliberately separates robustness from global code-space quality:
+    robustness keeps attacked views together, while top-k memory negatives,
+    diversity, balance, entropy and decorrelation prevent representation collapse.
+    """
     robustness = (clean - attacked).abs().mean()
 
     distances = _pairwise_hamming(clean)
     same = labels[:, None].eq(labels[None, :])
-    negative = distances.masked_fill(same, float("inf"))
-    hard_negative = negative.min(dim=1).values
+    batch_neg = distances.masked_fill(same, float("inf"))
+    batch_loss = _soft_negative_loss(batch_neg, margin, topk_negatives, temperature)
 
+    memory_loss = clean.new_tensor(0.0)
+    cross_min = batch_neg.min(dim=1).values
     if memory_codes is not None and memory_codes.numel() > 0:
         memory_codes = memory_codes.detach()
         memory_labels = memory_labels.detach() if memory_labels is not None else None
-        memory_distances = torch.cdist(clean, memory_codes, p=1) / clean.shape[1]
+        md = torch.cdist(clean, memory_codes, p=1) / clean.shape[1]
         if memory_labels is not None:
-            memory_same = labels[:, None].eq(memory_labels[None, :])
-            memory_distances = memory_distances.masked_fill(memory_same, float("inf"))
-        memory_hard = memory_distances.min(dim=1).values
-        hard_negative = torch.minimum(hard_negative, memory_hard)
+            md = md.masked_fill(labels[:, None].eq(memory_labels[None, :]), float("inf"))
+        memory_loss = _soft_negative_loss(md, margin, topk_negatives, temperature)
+        memory_min = md.min(dim=1).values
+        cross_min = torch.minimum(cross_min, memory_min)
 
-    valid = torch.isfinite(hard_negative)
-    violation = torch.relu(margin - hard_negative[valid]) if valid.any() else clean.new_zeros(1)
-    # Convex hinge plus a stronger penalty for very small/zero inter-image gaps.
-    discrimination = violation.mean() if violation.numel() else clean.new_tensor(0.0)
-    collision_barrier = (
-        (violation.clamp_min(0.0).pow(collision_power)).mean()
-        if violation.numel()
-        else clean.new_tensor(0.0)
-    )
-    discrimination = discrimination + 0.5 * collision_barrier
+    collision = (batch_loss + memory_loss) / (2.0 if memory_loss.detach().item() > 0 else 1.0)
+    discrimination = collision + 0.35 * collision.pow(max(collision_power, 1.0))
 
-    p = clean.mean(dim=0).clamp(1e-5, 1.0 - 1e-5)
+    # Balance/entropy are computed on clean and attacked codes to avoid learning
+    # a balanced clean code that becomes biased under attacks.
+    combined = torch.cat([clean, attacked], dim=0)
+    p = combined.mean(dim=0).clamp(1e-5, 1.0 - 1e-5)
     balance = (p - 0.5).pow(2).mean()
     entropy = -(p * torch.log2(p) + (1.0 - p) * torch.log2(1.0 - p)).mean()
 
-    centered = clean - clean.mean(dim=0, keepdim=True)
-    cov = centered.T @ centered / max(clean.shape[0] - 1, 1)
-    off_diag = cov - torch.diag(torch.diagonal(cov))
-    decorrelation = off_diag.pow(2).mean()
+    centered = combined - combined.mean(dim=0, keepdim=True)
+    std = centered.std(dim=0, unbiased=False).clamp_min(1e-4)
+    normalized = centered / std
+    corr_mat = (normalized.T @ normalized) / max(combined.shape[0], 1)
+    eye = torch.eye(corr_mat.shape[0], device=combined.device, dtype=combined.dtype)
+    decorrelation = ((corr_mat - eye) * (1.0 - eye)).pow(2).mean()
 
-    return {
-        "robustness": robustness,
-        "discrimination": discrimination,
-        "balance": balance,
-        "decorrelation": decorrelation,
-        "entropy_penalty": 1.0 - entropy,
-    }
+    valid = torch.isfinite(cross_min)
+    diversity = torch.relu(diversity_target - cross_min[valid]).pow(2).mean() if valid.any() else clean.new_tensor(0.0)
+
+    return {"robustness": robustness, "discrimination": discrimination, "balance": balance, "decorrelation": decorrelation, "entropy_penalty": 1.0 - entropy, "diversity": diversity}
 
 
 def _flatten_gradients(grads: list[Tensor | None], params: list[Tensor]) -> Tensor:
-    chunks = []
-    for grad, param in zip(grads, params):
-        chunks.append(torch.zeros_like(param).reshape(-1) if grad is None else grad.reshape(-1))
-    return torch.cat(chunks)
+    return torch.cat([torch.zeros_like(param).reshape(-1) if grad is None else grad.reshape(-1) for grad, param in zip(grads, params)])
 
 
 def _project_simplex(x: Tensor) -> Tensor:
@@ -175,22 +175,16 @@ def mgda_weights(losses: list[Tensor], model: nn.Module, steps: int = 25) -> Ten
         vectors.append(_flatten_gradients(grads, params))
     G = torch.stack(vectors, dim=1)
     gram = G.T @ G
-    task_count = len(losses)
-    weights = torch.full((task_count,), 1.0 / task_count, dtype=G.dtype, device=G.device)
-    spectral = float(torch.linalg.matrix_norm(gram, ord=2).detach().cpu()) if task_count > 1 else 1.0
+    count = len(losses)
+    weights = torch.full((count,), 1.0 / count, dtype=G.dtype, device=G.device)
+    spectral = float(torch.linalg.matrix_norm(gram, ord=2).detach().cpu()) if count > 1 else 1.0
     step = min(0.25, 1.0 / max(2.0 * spectral, 1e-6))
     for _ in range(max(1, steps)):
         weights = _project_simplex(weights - step * (2.0 * gram @ weights))
     return weights.detach()
 
 
-def _update_memory(
-    memory_codes: Tensor,
-    memory_labels: Tensor,
-    new_codes: Tensor,
-    new_labels: Tensor,
-    max_size: int,
-) -> tuple[Tensor, Tensor]:
+def _update_memory(memory_codes: Tensor, memory_labels: Tensor, new_codes: Tensor, new_labels: Tensor, max_size: int):
     if max_size <= 0:
         return memory_codes[:0], memory_labels[:0]
     codes = torch.cat([memory_codes, new_codes.detach()], dim=0)
@@ -202,12 +196,12 @@ def _update_memory(
 
 
 def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str | None = None):
-    """Train CAP-ZW with cross-batch memory mining and MGDA task balancing."""
+    """Train CAP-ZW v4 with balanced collision-memory Pareto optimization."""
     device = torch.device(config.device)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
     history: list[dict[str, float]] = []
-    task_names = ["robustness", "discrimination", "balance", "decorrelation", "entropy_penalty"]
+    task_names = ["robustness", "discrimination", "balance", "decorrelation", "entropy_penalty", "diversity"]
     memory_codes = torch.empty((0, config.nbits), dtype=torch.float32, device=device)
     memory_labels = torch.empty((0,), dtype=torch.long, device=device)
 
@@ -216,31 +210,20 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
         totals = {key: 0.0 for key in task_names + ["total", "memory_size"]}
         weight_totals = np.zeros(len(task_names), dtype=np.float64)
         batches = 0
-
         for batch in loader:
             clean_x, attacked_x, labels = batch[:3]
             clean_x = clean_x.to(device, non_blocking=True)
             attacked_x = attacked_x.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-
             clean = model(clean_x, hard=False)
             attacked = model(attacked_x, hard=False)
-            terms = objective_terms(
-                clean,
-                attacked,
-                labels,
-                config.margin,
-                memory_codes=memory_codes,
-                memory_labels=memory_labels,
-                collision_power=config.collision_power,
-            )
+
+            progress = min(1.0, memory_codes.shape[0] / max(config.memory_warmup, 1))
+            warm_margin = config.margin * (0.70 + 0.30 * progress)
+            terms = objective_terms(clean, attacked, labels, warm_margin, memory_codes if progress > 0 else None, memory_labels if progress > 0 else None, config.collision_power, config.topk_negatives, config.diversity_target, config.temperature)
             tasks = [terms[name] for name in task_names]
             mgda = mgda_weights(tasks, model, steps=config.mgda_steps)
-            scale = torch.tensor(
-                [config.lambda_robust, config.lambda_collision, config.lambda_balance, config.lambda_corr, config.lambda_entropy],
-                dtype=mgda.dtype,
-                device=device,
-            )
+            scale = torch.tensor([config.lambda_robust, config.lambda_collision, config.lambda_balance, config.lambda_corr, config.lambda_entropy, config.lambda_diversity], dtype=mgda.dtype, device=device)
             effective = mgda * scale
             effective = effective / effective.sum().clamp_min(1e-12)
             loss = sum(weight * task for weight, task in zip(effective, tasks))
@@ -249,8 +232,8 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
-
             memory_codes, memory_labels = _update_memory(memory_codes, memory_labels, clean, labels, config.memory_size)
+
             for key, value in terms.items():
                 totals[key] += float(value.detach())
             totals["total"] += float(loss.detach())
@@ -261,27 +244,18 @@ def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str 
         denom = max(batches, 1)
         row = {"epoch": float(epoch + 1)}
         row.update({key: value / denom for key, value in totals.items()})
-        row.update({f"w_{name}": float(weight_totals[i] / denom) for i, name in enumerate(["robust", "discrimination", "balance", "corr", "entropy"])})
+        row.update({f"w_{name}": float(weight_totals[i] / denom) for i, name in enumerate(["robust", "discrimination", "balance", "corr", "entropy", "diversity"])})
         history.append(row)
 
         if checkpoint:
             path = Path(checkpoint)
             path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "history": history,
-                    "config": config.__dict__,
-                },
-                path,
-            )
+            torch.save({"epoch": epoch + 1, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "history": history, "config": config.__dict__, "version": "CAP-ZW-v4"}, path)
     return history
 
 
 class CAPZWHashNet(HashEncoder):
-    """CAP-ZW v3: BEMQ encoder + cross-batch collision memory + MGDA."""
+    """CAP-ZW v4: BEMQ encoder + balanced collision memory + MGDA."""
 
     def __init__(self, nbits: int = 256, base_channels: int = 32):
         super().__init__(nbits=nbits, base_channels=base_channels, use_bemq=True)
