@@ -5,7 +5,7 @@ from zero_watermarking.training import CAP_ZW_VERSION, PairAttackDataset, object
 
 
 def test_version_is_single_source_of_truth():
-    assert CAP_ZW_VERSION == "CAP-ZW-v8"
+    assert CAP_ZW_VERSION == "CAP-ZW-v9"
 
 
 def test_multiview_dataset_length_and_labels():
@@ -39,4 +39,18 @@ def test_objective_returns_discrete_collision_term():
     assert torch.isfinite(terms["binary_collision"])
     total = sum(terms.values())
     total.backward()
+    assert clean.grad is not None
+
+
+def test_collision_mass_term_is_finite():
+    clean = torch.tensor(
+        [[0.9, 0.1, 0.9, 0.1], [0.8, 0.2, 0.8, 0.2], [0.1, 0.9, 0.1, 0.9]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    attacked = clean.detach().clone().requires_grad_(True)
+    labels = torch.tensor([0, 1, 2], dtype=torch.long)
+    terms = objective_terms(clean, attacked, labels, margin=0.30, binary_collision_target=0.50, topk_negatives=2)
+    assert torch.isfinite(terms["binary_collision"])
+    terms["binary_collision"].backward()
     assert clean.grad is not None
