@@ -37,8 +37,21 @@ def load_model(checkpoint: Path, bits: int, device: str) -> CAPZWHashNet:
     return model
 
 
+def _clean_pair_distances(bank: dict[str, np.ndarray]) -> np.ndarray:
+    ids = sorted(bank)
+    values = []
+    for i, left in enumerate(ids):
+        for right in ids[i + 1 :]:
+            values.append(float(np.mean(bank[left] != bank[right])))
+    return np.asarray(values, dtype=np.float64)
+
+
+def _intra_distances(result: dict) -> np.ndarray:
+    return np.asarray([float(row[2]) for row in result.get("details", [])], dtype=np.float64)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate CAP-ZW on a held-out medical split.")
+    parser = argparse.ArgumentParser(description="Evaluate CAP-ZW on a held-out medical split with collision-tail diagnostics.")
     parser.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
     parser.add_argument("--split", default="test")
     parser.add_argument("--checkpoint", default="experiments/checkpoints/cap_zw.pt")
@@ -47,6 +60,7 @@ def main() -> int:
     parser.add_argument("--size", type=int, default=128)
     parser.add_argument("--bits", type=int, default=256)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--near-threshold", type=float, default=0.10)
     args = parser.parse_args()
 
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu" if args.device == "auto" else args.device
@@ -87,7 +101,19 @@ def main() -> int:
     result = evaluate_hash_bank(clean_bank, attacked_bank)
     bits_matrix = np.stack([clean_bank[key] for key in sorted(clean_bank)])
     entropy, _ = bit_entropy(bits_matrix)
+
+    inter = _clean_pair_distances(clean_bank)
+    intra = _intra_distances(result)
+    # Robust tail separation complements the exact min/max collision gap.
+    inter_q05 = float(np.quantile(inter, 0.05)) if inter.size else float("nan")
+    inter_q10 = float(np.quantile(inter, 0.10)) if inter.size else float("nan")
+    intra_q90 = float(np.quantile(intra, 0.90)) if intra.size else float("nan")
+    intra_q95 = float(np.quantile(intra, 0.95)) if intra.size else float("nan")
+    q05_tail_gap = inter_q05 - intra_q95 if inter.size and intra.size else float("nan")
+    q10_tail_gap = inter_q10 - intra_q90 if inter.size and intra.size else float("nan")
+
     summary = {
+        "version": "CAP-ZW-v5",
         "split": args.split,
         "images": len(clean_bank),
         "bits": args.bits,
@@ -98,6 +124,12 @@ def main() -> int:
         "mean_inter_hd": result["mean_inter_hd"],
         "min_inter_hd": result["min_inter_hd"],
         "collision_gap": result["collision_gap"],
+        "inter_q05": inter_q05,
+        "inter_q10": inter_q10,
+        "intra_q90": intra_q90,
+        "intra_q95": intra_q95,
+        "q05_tail_gap": q05_tail_gap,
+        "q10_tail_gap": q10_tail_gap,
         "auc": result["auc"],
         "eer": result["eer"],
         "balance_error": bit_balance(bits_matrix),
@@ -110,20 +142,23 @@ def main() -> int:
     pd.DataFrame([summary]).to_csv(out / "summary.csv", index=False)
     pd.DataFrame(result["details"], columns=["image_id", "attack", "hamming", "nc"]).to_csv(out / "attack_details.csv", index=False)
 
-    # Collision diagnostics: retain exact and near-duplicate clean hashes.
     ids = sorted(clean_bank)
     pairs: list[dict[str, object]] = []
     for i, left in enumerate(ids):
         for right in ids[i + 1 :]:
             distance = float(np.mean(clean_bank[left] != clean_bank[right]))
-            if distance <= 0.05:
-                pairs.append({"image_a": left, "image_b": right, "hamming": distance, "exact_collision": distance == 0.0})
-    collision_frame = pd.DataFrame(pairs, columns=["image_a", "image_b", "hamming", "exact_collision"])
+            if distance <= args.near_threshold:
+                pairs.append({"image_a": left, "image_b": right, "hamming": distance, "exact_collision": distance == 0.0, "near_collision": distance <= args.near_threshold})
+    collision_frame = pd.DataFrame(pairs, columns=["image_a", "image_b", "hamming", "exact_collision", "near_collision"])
     collision_frame.to_csv(out / "collision_pairs.csv", index=False)
 
+    exact = int((collision_frame["exact_collision"] == True).sum()) if not collision_frame.empty else 0
+    near = int(len(collision_frame))
+    ultra_near = int((collision_frame["hamming"] <= 0.05).sum()) if not collision_frame.empty else 0
     print(pd.Series(summary).to_string())
-    print(f"near_collision_pairs={len(collision_frame)}")
-    print(f"exact_collision_pairs={int(collision_frame['exact_collision'].sum()) if not collision_frame.empty else 0}")
+    print(f"near_collision_pairs_<={args.near_threshold:.2f}={near}")
+    print(f"ultra_near_pairs_<=0.05={ultra_near}")
+    print(f"exact_collision_pairs={exact}")
     print(f"Results written to {out.resolve()}")
     return 0
 
