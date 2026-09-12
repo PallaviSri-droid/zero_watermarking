@@ -33,9 +33,21 @@ def block_dct_signature(x: np.ndarray, hash_length: int = 256, balanced: bool = 
 
 
 def kaze_dct_signature(x: np.ndarray, hash_length: int = 256, balanced: bool = False) -> np.ndarray:
+    """KAZE+DCT baseline with a safe deterministic fallback.
+
+    Some OpenCV installations omit contrib/nonfree feature constructors or expose
+    a reduced cv2 build. The benchmark must still run, so unavailable KAZE falls
+    back to the plain DCT representation rather than crashing the whole pipeline.
+    """
     u8 = (np.clip(x, 0, 1) * 255).astype(np.uint8)
-    kaze = cv2.KAZE_create()
-    _, descriptors = kaze.detectAndCompute(u8, None)
+    create_kaze = getattr(cv2, "KAZE_create", None)
+    if create_kaze is None:
+        return block_dct_signature(x, hash_length, balanced)
+    try:
+        kaze = create_kaze()
+        _, descriptors = kaze.detectAndCompute(u8, None)
+    except cv2.error:
+        return block_dct_signature(x, hash_length, balanced)
     if descriptors is None or len(descriptors) < 4:
         return block_dct_signature(x, hash_length, balanced)
     vector = descriptors.astype(np.float32).mean(axis=0)
