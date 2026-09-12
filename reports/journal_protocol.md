@@ -1,52 +1,163 @@
 # Journal-Grade Experimental Protocol
 
-## Research hypothesis
-CAP-ZW is designed to improve the robustness/discriminability trade-off of medical-image zero-watermarking by explicitly optimizing attacked-view consistency, hard-negative separation, bit balance/entropy, and bit decorrelation under a multi-objective training procedure.
+## 1. Research question
 
-## Primary comparison
-Every method is evaluated on the same held-out patient/study groups, image size, hash length, attacks, attack strengths, watermark length, and verification rule.
+CAP-ZW tests whether a **collision-aware multi-objective zero-watermarking formulation** can improve the robustness/discriminability trade-off for medical images while reducing cross-image hash collisions under a common evaluation protocol.
 
-## Baselines
+The scientific contribution is the formulation and evidence around collision-aware optimization/evaluation. Individual ingredients such as STE/BEMQ, balanced hashing, contrastive objectives, BCH-style coding, CNN features, memory-bank mining or MGDA-style optimization are not claimed as novel by themselves.
+
+## 2. Controlled comparison
+
+All methods compared in the main table must use the same:
+
+- patient/group-level split;
+- image preprocessing and resolution;
+- hash length;
+- watermark length and verification rule;
+- attack types and strengths;
+- negative-pair sampling/evaluation set;
+- metric implementation and thresholding rule.
+
+Literature-reported values and independently reproduced values must remain in separate tables.
+
+## 3. Baseline set
+
+The minimum safe classical comparison is:
+
 1. DCT-Mean
 2. DCT-Balanced
-3. KAZE-DCT-Mean
-4. KAZE-DCT-Balanced
-5. ResNet50-DCT (pretrained deep feature baseline)
-6. AlexNet feature + DCT proxy baseline
-7. Additional published methods only when their algorithms can be reproduced from the paper/code without ambiguous assumptions.
+3. Edge-DCT
 
-## Proposed method
-CAP-ZW with BEMQ/STE binary hashing, attack-paired training, hard-negative collision loss, balance/entropy regularization, bit-decorrelation regularization, and MGDA-style task weighting.
+Learning-based baselines may be added only when their implementation, weights and preprocessing can be reproduced without hidden assumptions. KAZE variants must not be reported as independent baselines when the runtime does not provide a true KAZE implementation; a fallback to another feature extractor is not equivalent to KAZE.
 
-## Primary metrics
-- mean NC (higher is better)
-- mean BER (lower is better)
-- maximum intra-image normalized Hamming distance (lower is better)
-- minimum inter-image normalized Hamming distance (higher is better)
-- collision gap = minimum inter-image distance - maximum intra-image distance (higher is better)
-- ROC-AUC (higher is better)
-- EER (lower is better)
-- false acceptance / false rejection at a stated operating threshold
+## 4. Proposed method
 
-## Hash-quality metrics
-- mean bit entropy
-- absolute balance error from p=0.5
-- mean absolute off-diagonal bit correlation
+The locked development candidate is `CAP-ZW-final-candidate`, combining the empirically useful collision-focused mechanisms from the v9 reference with the selective robustness guard from v11. The candidate is a starting point for controlled selection, not a presumed winner.
 
-## Robustness protocol
-Use a fixed attack grid covering additive noise, blur, JPEG compression, rotation, crop-resize and compound attacks. Report curves against attack strength, not only one aggregate number.
+The core objective family includes:
 
-## Statistical protocol
-Run at least 5 independent seeds for model-training experiments. Report mean, standard deviation and bootstrap 95% confidence intervals. Use paired tests across identical image/attack pairs when comparing methods. Do not tune the final test threshold on the test set.
+- multi-view attack consistency;
+- hard-negative separation with memory-bank mining;
+- collision-tail and collision-mass pressure;
+- binary/thresholded-code collision pressure;
+- balance and entropy regularization;
+- bit decorrelation;
+- MGDA-style task balancing;
+- selective worst-fraction robustness protection.
 
-## Leakage control
-For volumetric, longitudinal or multi-view data, split by patient/study group. Never allow a patient/study identifier to occur in more than one of train/validation/test.
+## 5. Primary metrics
 
-## Reproducibility
-Record Python/package versions, dataset version, manifest hash, random seeds, checkpoint hash, configuration and attack parameters for every experiment.
+### Robustness
 
-## Novelty discipline
-Standard components (DCT, KAZE, CNNs, contrastive learning, balanced hashing, STE/BEMQ, BCH, chaotic encryption and Pareto optimization) are not claimed as novel individually. Novelty must be framed around the exact collision-aware formulation, its zero-watermarking integration, attack-stratified protocol and empirically validated robustness/discriminability improvement.
+- mean NC ↑
+- mean BER ↓
+- mean intra-image normalized Hamming distance ↓
+- maximum intra-image normalized Hamming distance ↓
 
-## Publication claim rule
-No claimed percentage improvement is written into the paper until it is computed from the held-out experimental results. Published numbers from other papers remain in a separate literature table and are never mixed with reproduced results.
+### Verification/discriminability
+
+- mean inter-image normalized Hamming distance ↑
+- minimum inter-image normalized Hamming distance ↑
+- ROC-AUC ↑
+- EER ↓
+- FAR/FRR at a pre-specified operating threshold
+
+### Collision risk
+
+Report both raw counts and rates normalized per 10,000 negative pairs:
+
+- exact collision (`HD = 0`);
+- ultra-near collision (`HD <= 0.05`);
+- near collision (`HD <= 0.10`).
+
+Always print the negative-pair denominator.
+
+### Tail separation
+
+- inter-image q01, q05, q10;
+- intra-image q90, q95;
+- q05 tail gap = inter q05 - intra q95;
+- q10 tail gap = inter q10 - intra q90.
+
+`collision_gap = min(inter-image HD) - max(intra-image HD)` is retained as a diagnostic only; it is highly sensitive to evaluation-set size and individual pathological pairs.
+
+### Hash quality
+
+- balance error ↓
+- mean bit entropy ↑
+- mean absolute off-diagonal bit correlation ↓
+
+## 6. NIH ChestX-ray14 protocol
+
+Use patient identifiers as the grouping variable. No patient/study may occur in more than one of train, validation or test. The test split remains locked during model selection.
+
+For every reported run, record:
+
+- number of images;
+- number of unique patients/groups;
+- image resolution;
+- hash length;
+- manifest checksum;
+- dataset source/version;
+- preprocessing version;
+- software environment;
+- random seed;
+- checkpoint identifier/hash;
+- attack-grid identifier.
+
+## 7. Fixed attack benchmark
+
+The main benchmark must use one fixed attack grid across candidates. The repository protocol currently includes Gaussian noise, Gaussian blur, JPEG compression, small rotations and crop-resize; translation and deterministic compound attacks are included when the locked experiment configuration specifies them.
+
+Attack-wise results must be reported in addition to aggregate robustness. The attack grid must not be changed after inspecting test results without labeling the run exploratory.
+
+## 8. Training/selection statistics
+
+Use independent seeds. The publication target is **5 seeds** for shortlisted configurations; 2 seeds are acceptable only for early smoke screening.
+
+For each metric, retain all seed-level values. Report:
+
+- mean;
+- standard deviation;
+- 95% Student-t confidence interval across seeds.
+
+For paired method comparisons, use paired seed comparisons where the design permits and report an effect size. Correct for multiple comparisons when many configurations are tested. Never fabricate a confidence interval from a single run.
+
+## 9. Controlled candidate selection
+
+Starting from the v11 regime, vary one factor at a time before considering a larger factorial search:
+
+- selective-guard batch fraction;
+- guard multiplier/growth;
+- binary-collision target;
+- hard-negative top-k.
+
+Keep architecture, optimizer family, attack grid, data split, evaluator and reporting code fixed while these factors are changed.
+
+The selection decision must be made using training/validation data. The test set is evaluated only after the configuration is locked.
+
+## 10. Reproducibility artifacts
+
+Every reported number must map to:
+
+`repository commit → configuration → seed → manifest → checkpoint → evaluator → attack grid → metric table`
+
+Generated datasets, checkpoints and large experiment outputs remain outside version control. Source code, configuration, notebooks, evaluation scripts and research documentation are version-controlled.
+
+## 11. Publication figures/tables
+
+The minimum paper-ready set is:
+
+1. Robustness-vs-collision Pareto scatter.
+2. EER vs exact/near-collision rate per 10k negative pairs.
+3. Attack-wise NC/BER distributions.
+4. Inter-image vs intra-image Hamming-distance distributions with tail markers.
+5. Hash balance, entropy and decorrelation comparison.
+6. Controlled ablation table for selective robustness guard, binary collision pressure, hard-negative mining and MGDA.
+7. Multi-seed mean ± 95% CI table.
+
+## 12. Claim discipline
+
+Do not state that CAP-ZW is superior until the common reproduced benchmark supports the claim. Do not copy percentages from literature into the proposed-method results. Report negative or non-significant findings when they occur.
+
+The defensible novelty statement is: **a collision-aware multi-objective formulation and evaluation protocol for medical-image zero-watermarking that explicitly couples attacked-view robustness, different-image separation and collision-tail risk.**
