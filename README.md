@@ -10,19 +10,23 @@ Working research label: **CAP-ZW (Collision-Aware Pareto Zero-Watermarking)**. T
 
 ## Current learned formulation
 
-The active learned formulation is resolved from `zero_watermarking.training.CAP_ZW_VERSION` and stored in each checkpoint. The current implementation is **CAP-ZW-v8**.
+The project preserves the original CAP-ZW-v9 collision-focused formulation as the strongest current comparison model and adds **CAP-ZW-v11** as the active development formulation. v10 is retained as an evaluated robustness-guard variant but is not treated as the preferred operating point.
 
-CAP-ZW v8 adds discrete collision-aware optimization directly on the thresholded BEMQ code while retaining:
+CAP-ZW-v9 uses:
 
 - cross-batch memory mining;
 - top-k hard-negative separation;
 - continuous collision-tail and diversity objectives;
+- discrete thresholded-code collision control;
+- collision-mass pressure over multiple hardest negatives;
 - multi-view attack training;
 - robustness-budget / floor regularization;
 - clean/attacked consistency;
 - clean + attacked bit balance and entropy regularization;
 - hard-code-aware decorrelation;
 - MGDA-style multi-objective gradient weighting.
+
+CAP-ZW-v11 keeps the v9 objective but adds a **selective robustness guard** that focuses on the worst robustness fraction of each batch plus a high-quantile term, rather than imposing a strong global robustness constraint. The guard is intentionally soft and adaptive so that collision/discriminability objectives can remain active when the model is already within its robustness budget.
 
 The central hypothesis is not that any individual ingredient is new. The research question is whether this **joint collision-aware formulation and evaluation protocol** produces a measurable improvement in the robustness/discriminability trade-off and reduces cross-image hash collisions under a common medical-image benchmark.
 
@@ -54,7 +58,9 @@ Robustness evaluation
         ↓
 Discriminability + collision-tail analysis
         ↓
-CAP-ZW training
+CAP-ZW-v9 baseline
+        ↓
+CAP-ZW-v11 selective-robustness refinement
         ↓
 Ablation study
         ↓
@@ -79,36 +85,45 @@ python -m pip install -e .
 python scripts/run_all.py
 ```
 
-## CAP-ZW training
+## CAP-ZW-v11 training
 
-The training CLI exposes the active formulation and its parameters:
+The v11 trainer is isolated from the original v9 CLI so that both configurations remain reproducible:
 
 ```powershell
-python scripts\train_cap_zw.py --help
+python scripts\train_cap_zw_v11.py --help
 ```
 
-A small controlled pilot can be run with:
+A controlled pilot can be run with:
 
 ```powershell
-python scripts\train_cap_zw.py `
+python scripts\train_cap_zw_v11.py `
   --manifest data\manifests\medical_manifest.csv `
   --split train_val `
   --limit 512 `
   --size 128 `
   --bits 128 `
-  --epochs 2 `
+  --epochs 3 `
   --batch-size 8 `
-  --memory-size 256 `
+  --memory-size 1024 `
   --memory-warmup 128 `
-  --topk-negatives 8 `
+  --topk-negatives 12 `
   --robust-target 0.022 `
   --robust-softness 0.008 `
   --robustness-quantile 0.80 `
   --attack-views 3 `
   --tail-target 0.26 `
   --diversity-target 0.36 `
-  --binary-collision-target 0.125 `
+  --binary-collision-target 0.135 `
   --temperature 0.08 `
+  --guard-target 0.021 `
+  --guard-quantile 0.85 `
+  --guard-softness 0.008 `
+  --guard-lambda 0.55 `
+  --guard-growth 0.10 `
+  --guard-max 2.50 `
+  --guard-tail-weight 0.70 `
+  --guard-mean-weight 0.20 `
+  --guard-batch-fraction 0.25 `
   --mgda-steps 15
 ```
 
@@ -118,7 +133,7 @@ python scripts\train_cap_zw.py `
 python scripts\evaluate_cap_zw.py `
   --manifest data\manifests\medical_manifest.csv `
   --split test `
-  --checkpoint experiments\checkpoints\cap_zw.pt `
+  --checkpoint experiments\checkpoints\cap_zw_v11.pt `
   --limit 200 `
   --size 128 `
   --bits 128
@@ -156,4 +171,4 @@ After the NIH experiment is stable, add **CheXpert** and/or **MIMIC-CXR-JPG** fo
 
 ## Research status
 
-The software pipeline and CAP-ZW training path are execution-tested locally. Scientific conclusions remain pending real-dataset experiments, multiple seeds, confidence intervals, and the complete ablation/benchmark matrix.
+CAP-ZW-v9 remains the strongest evaluated collision-focused reference from the current development cycle. CAP-ZW-v10 demonstrated that an overly strong global robustness guard can collapse bit diversity and collision separation. CAP-ZW-v11 is the next controlled refinement and requires fresh execution, multi-seed evaluation, confidence intervals, and the complete ablation/benchmark matrix before any scientific superiority claim is made.
