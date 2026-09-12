@@ -97,36 +97,39 @@ def _finite_topk(values: Tensor, k: int) -> list[Tensor]:
     return rows
 
 
-def _soft_negative_loss(distances: Tensor | None, margin: float, topk: int, temperature: float) -> Tensor:
+def _soft_negative_loss(distances: Tensor | None, margin: float, topk: int, temperature: float, device: torch.device) -> Tensor:
     if distances is None or distances.numel() == 0:
-        return torch.tensor(0.0)
+        return torch.zeros((), device=device)
     rows = _finite_topk(distances, topk)
     tau = max(float(temperature), 1e-4)
     return torch.stack([F.softplus((float(margin) - r) / tau).mul(tau).mean() for r in rows]).mean()
 
 
-def _tail_collision_loss(distances: Tensor | None, target: float, topk: int, power: float) -> Tensor:
+def _tail_collision_loss(distances: Tensor | None, target: float, topk: int, power: float, device: torch.device) -> Tensor:
     if distances is None or distances.numel() == 0:
-        return torch.tensor(0.0)
+        return torch.zeros((), device=device)
     rows = _finite_topk(distances, topk)
     penalties = [F.relu(float(target) - r.min()).pow(max(float(power), 1.0)) for r in rows]
     return torch.stack(penalties).mean()
 
 
-def _uniformity_loss(distances: Tensor | None, temperature: float, topk: int) -> Tensor:
+def _uniformity_loss(distances: Tensor | None, temperature: float, topk: int, device: torch.device) -> Tensor:
     if distances is None or distances.numel() == 0:
-        return torch.tensor(0.0)
+        return torch.zeros((), device=device)
     rows = _finite_topk(distances, topk)
     tau = max(float(temperature), 1e-4)
     return torch.stack([torch.exp(-r / tau).mean() for r in rows]).mean()
 
 
 def objective_terms(clean: Tensor, attacked: Tensor, labels: Tensor, margin: float, memory_codes: Tensor | None = None, memory_labels: Tensor | None = None, collision_power: float = 2.0, topk_negatives: int = 8, diversity_target: float = 0.45, tail_target: float = 0.34, uniformity_temperature: float = 0.08, robustness_quantile: float = 0.80) -> Dict[str, Tensor]:
-    """CAP-ZW v5: optimize robustness plus the lower tail of inter-image separation."""
+    """CAP-ZW v5 objectives: robustness + collision-tail separation + code-space quality."""
+    if clean.ndim != 2 or attacked.ndim != 2 or clean.shape != attacked.shape:
+        raise ValueError("clean and attacked must both have shape [B, nbits]")
     pair_codes = torch.cat([clean, attacked], dim=0)
     pair_labels = torch.cat([labels, labels], dim=0)
 
-    per_sample_robust = (clean - attacked).abs().mean(dim=(1, 2, 3))
+    # Hash robustness is measured per sample over bits (model outputs are [B, nbits]).
+    per_sample_robust = (clean - attacked).abs().mean(dim=1)
     q = float(min(max(robustness_quantile, 0.5), 1.0))
     q_value = torch.quantile(per_sample_robust.detach(), q)
     robust_weights = torch.sigmoid((per_sample_robust - q_value) / 0.01) + 0.25
@@ -142,22 +145,22 @@ def objective_terms(clean: Tensor, attacked: Tensor, labels: Tensor, margin: flo
         if memory_labels is not None:
             memory_neg = memory_neg.masked_fill(pair_labels[:, None].eq(memory_labels.detach()[None, :]), float("inf"))
 
-    soft_batch = _soft_negative_loss(pair_neg, margin, topk_negatives, uniformity_temperature)
-    soft_memory = _soft_negative_loss(memory_neg, margin, topk_negatives, uniformity_temperature) if memory_neg is not None else clean.new_tensor(0.0)
+    soft_batch = _soft_negative_loss(pair_neg, margin, topk_negatives, uniformity_temperature, clean.device)
+    soft_memory = _soft_negative_loss(memory_neg, margin, topk_negatives, uniformity_temperature, clean.device) if memory_neg is not None else torch.zeros((), device=clean.device)
     discrimination = (soft_batch + soft_memory) / (2.0 if memory_neg is not None else 1.0)
 
-    batch_tail = _tail_collision_loss(pair_neg, tail_target, topk_negatives, collision_power)
-    memory_tail = _tail_collision_loss(memory_neg, tail_target, topk_negatives, collision_power) if memory_neg is not None else clean.new_tensor(0.0)
+    batch_tail = _tail_collision_loss(pair_neg, tail_target, topk_negatives, collision_power, clean.device)
+    memory_tail = _tail_collision_loss(memory_neg, tail_target, topk_negatives, collision_power, clean.device) if memory_neg is not None else torch.zeros((), device=clean.device)
     tail_collision = (batch_tail + memory_tail) / (2.0 if memory_neg is not None else 1.0) + 0.25 * discrimination
 
     cross_min = pair_neg.min(dim=1).values
     if memory_neg is not None:
         cross_min = torch.minimum(cross_min, memory_neg.min(dim=1).values)
     valid = torch.isfinite(cross_min)
-    diversity = F.relu(float(diversity_target) - cross_min[valid]).pow(2).mean() if valid.any() else clean.new_tensor(0.0)
+    diversity = F.relu(float(diversity_target) - cross_min[valid]).pow(2).mean() if valid.any() else torch.zeros((), device=clean.device)
 
     sources = [pair_neg] + ([memory_neg] if memory_neg is not None else [])
-    uniformity = torch.stack([_uniformity_loss(s, uniformity_temperature, topk_negatives).to(clean.device) for s in sources]).mean()
+    uniformity = torch.stack([_uniformity_loss(s, uniformity_temperature, topk_negatives, clean.device) for s in sources]).mean()
 
     combined = torch.cat([clean, attacked], dim=0)
     p = combined.mean(dim=0).clamp(1e-5, 1.0 - 1e-5)
@@ -171,15 +174,7 @@ def objective_terms(clean: Tensor, attacked: Tensor, labels: Tensor, margin: flo
     eye = torch.eye(corr_mat.shape[0], device=combined.device, dtype=combined.dtype)
     decorrelation = ((corr_mat - eye) * (1.0 - eye)).pow(2).mean()
 
-    return {
-        "robustness": robustness,
-        "tail_collision": tail_collision,
-        "diversity": diversity,
-        "balance": balance,
-        "decorrelation": decorrelation,
-        "entropy_penalty": 1.0 - entropy,
-        "uniformity": uniformity,
-    }
+    return {"robustness": robustness, "tail_collision": tail_collision, "diversity": diversity, "balance": balance, "decorrelation": decorrelation, "entropy_penalty": 1.0 - entropy, "uniformity": uniformity}
 
 
 def _flatten_gradients(grads: list[Tensor | None], params: list[Tensor]) -> Tensor:
@@ -199,6 +194,8 @@ def _project_simplex(x: Tensor) -> Tensor:
 
 
 def mgda_weights(losses: list[Tensor], model: nn.Module, steps: int = 25) -> Tensor:
+    if not losses:
+        raise ValueError("losses must not be empty")
     params = [p for p in model.parameters() if p.requires_grad]
     vectors = []
     for loss in losses:
@@ -227,7 +224,7 @@ def _update_memory(memory_codes: Tensor, memory_labels: Tensor, new_codes: Tenso
 
 
 def train_cap_zw(model: nn.Module, loader, config: TrainConfig, checkpoint: str | None = None):
-    """Train CAP-ZW v5 with collision-tail curriculum and Pareto optimization."""
+    """Train CAP-ZW v5 with tail-collision curriculum and Pareto optimization."""
     device = torch.device(config.device)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=2e-4)
