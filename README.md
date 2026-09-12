@@ -8,25 +8,38 @@ The project tests whether jointly optimizing same-image robustness, different-im
 
 Working research label: **CAP-ZW (Collision-Aware Pareto Zero-Watermarking)**. This is a research label, not a claim of prior publication.
 
-## Current learned formulation: CAP-ZW v5
+## Current learned formulation
 
-CAP-ZW v5 adds a **collision-tail objective** to explicitly penalize the closest different-image hashes, together with:
+The active learned formulation is resolved from `zero_watermarking.training.CAP_ZW_VERSION` and stored in each checkpoint. The current implementation is **CAP-ZW-v8**.
+
+CAP-ZW v8 adds discrete collision-aware optimization directly on the thresholded BEMQ code while retaining:
 
 - cross-batch memory mining;
 - top-k hard-negative separation;
-- a global hash-space uniformity penalty;
-- balance + entropy + decorrelation regularization computed on clean and attacked views;
-- tail-sensitive robustness weighting so difficult attacks are not hidden by the mean;
-- curriculum scheduling that increases separation pressure during training;
+- continuous collision-tail and diversity objectives;
+- multi-view attack training;
+- robustness-budget / floor regularization;
+- clean/attacked consistency;
+- clean + attacked bit balance and entropy regularization;
+- hard-code-aware decorrelation;
 - MGDA-style multi-objective gradient weighting.
 
 The central hypothesis is not that any individual ingredient is new. The research question is whether this **joint collision-aware formulation and evaluation protocol** produces a measurable improvement in the robustness/discriminability trade-off and reduces cross-image hash collisions under a common medical-image benchmark.
+
+## Metrics
 
 Core diagnostic:
 
 `collision_gap = min(inter-image Hamming distance) - max(intra-image Hamming distance)`
 
-Additional tail diagnostics are reported with inter-image lower quantiles and intra-image upper quantiles, including `q05_tail_gap` and `q10_tail_gap`.
+Tail diagnostics include:
+
+- `inter_q05`, `inter_q10`
+- `intra_q90`, `intra_q95`
+- `q05_tail_gap`, `q10_tail_gap`
+- near-collision, ultra-near-collision and exact-collision counts
+
+Primary performance metrics are NC, BER, intra-image Hamming distance, inter-image Hamming distance, ROC-AUC, EER, balance error, bit entropy and mean absolute inter-bit correlation.
 
 ## Workflow
 
@@ -41,7 +54,7 @@ Robustness evaluation
         ↓
 Discriminability + collision-tail analysis
         ↓
-CAP-ZW v5 training
+CAP-ZW training
         ↓
 Ablation study
         ↓
@@ -56,27 +69,6 @@ All compared methods use the same image split, image size, hash length, attack s
 
 Reproduced results are kept separate from values quoted from the literature. No improvement percentage is hard-coded or fabricated.
 
-## Main metrics
-
-- NC ↑, BER ↓
-- mean / maximum intra-image Hamming distance ↓
-- mean / minimum inter-image Hamming distance ↑
-- inter-image lower-tail quantiles ↑
-- intra-image upper-tail quantiles ↓
-- ROC-AUC ↑, FAR ↓, FRR ↓, EER ↓
-- collision gap ↑
-- near/exact collision counts ↓
-- bit balance error ↓
-- mean bit entropy ↑
-- mean absolute inter-bit correlation ↓
-
-## Candidate contribution axes
-
-1. Explicit **collision-tail aware optimization** for zero-watermark representations, rather than relying only on average pair separation.
-2. **Pareto/multi-objective optimization** across robustness, discrimination and hash-quality objectives.
-3. **Cross-batch collision memory + top-k hard-negative mining** for global rather than batch-local separation.
-4. A reproducible **statistical benchmark + ablation framework** suitable for journal experiments.
-
 DCT, DTCWT, KAZE, contrastive learning, balanced hashing, STE/BEMQ, BCH, chaos and multi-objective optimization are individually established ideas. Novelty must therefore be demonstrated by the specific formulation, integration, protocol and evidence.
 
 ## Quick start
@@ -87,7 +79,15 @@ python -m pip install -e .
 python scripts/run_all.py
 ```
 
-## CAP-ZW v5 pilot
+## CAP-ZW training
+
+The training CLI exposes the active formulation and its parameters:
+
+```powershell
+python scripts\train_cap_zw.py --help
+```
+
+A small controlled pilot can be run with:
 
 ```powershell
 python scripts\train_cap_zw.py `
@@ -101,13 +101,18 @@ python scripts\train_cap_zw.py `
   --memory-size 256 `
   --memory-warmup 128 `
   --topk-negatives 8 `
-  --tail-target 0.34 `
-  --diversity-target 0.45 `
+  --robust-target 0.022 `
+  --robust-softness 0.008 `
+  --robustness-quantile 0.80 `
+  --attack-views 3 `
+  --tail-target 0.26 `
+  --diversity-target 0.36 `
+  --binary-collision-target 0.125 `
   --temperature 0.08 `
   --mgda-steps 15
 ```
 
-Evaluation:
+## Evaluation
 
 ```powershell
 python scripts\evaluate_cap_zw.py `
@@ -119,6 +124,8 @@ python scripts\evaluate_cap_zw.py `
   --bits 128
 ```
 
+The evaluator resolves the model version from checkpoint metadata rather than hard-coding a version string.
+
 ## Recommended real dataset: NIH ChestX-ray14
 
 For the first full experiment we use **NIH ChestX-ray14**. It contains 112,120 frontal chest X-rays from 30,805 patients and includes 14 thoracic pathology labels. The Kaggle mirror is convenient for local download, while the patient identifier can be used directly as `group_id` to prevent patient-level leakage.
@@ -129,13 +136,7 @@ Kaggle authentication:
 kaggle auth login
 ```
 
-Download, recursively extract nested image archives, read the NIH metadata, match image files, and build a verified manifest automatically:
-
-```powershell
-python scripts\prepare_nih_chestxray14.py
-```
-
-For a smaller pilot:
+Prepare a reproducible manifest:
 
 ```powershell
 python scripts\prepare_nih_chestxray14.py --max-images 5000
@@ -147,30 +148,12 @@ The resulting manifest is:
 data/manifests/medical_manifest.csv
 ```
 
-The NIH-specific preparation script prefers the dataset's standard `train_val_list.txt` and `test_list.txt` files when present and records the actual `Patient ID` as `group_id`. This is preferable to the generic manifest generator, which can only infer grouping when metadata are unavailable.
+For publication experiments, keep the exact manifest, split, preprocessing, seed, hash length, attack grid and configuration used for every reported experiment.
 
 ## External validation plan
 
-After the NIH experiment is stable, add **CheXpert** and/or **MIMIC-CXR-JPG** for external validation. These datasets have different access procedures and should be treated as separate validation cohorts.
-
-## Structure
-
-```text
-zero_watermarking/
-├── configs/
-├── data/images/
-├── data/raw/
-├── experiments/results/
-├── figures/
-├── notebooks/
-├── reports/
-├── scripts/
-│   ├── prepare_nih_chestxray14.py
-│   └── ...
-├── src/zero_watermarking/
-└── tests/
-```
+After the NIH experiment is stable, add **CheXpert** and/or **MIMIC-CXR-JPG** for external validation. These datasets have different access procedures and should not block the main NIH pipeline.
 
 ## Research status
 
-The CAP-ZW v5 formulation is implemented in the repository. v4 pilot results motivated the tail-collision upgrade, but no claim of overall superiority should be made until v5 is evaluated against the same baselines on the same held-out images across multiple seeds and attacks, with confidence intervals and a complete ablation matrix.
+The software pipeline and CAP-ZW training path are execution-tested locally. Scientific conclusions remain pending real-dataset experiments, multiple seeds, confidence intervals, and the complete ablation/benchmark matrix.
