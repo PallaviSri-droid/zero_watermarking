@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: "Collision-Aware Pareto Zero-Watermarking for Medical Images"
+type: software
+abstract: >-
+  Reproducible research software for collision-aware multi-objective
+  zero-watermarking of medical images, including robustness, discriminability,
+  collision-tail metrics, controlled multi-seed evaluation, and publication
+  analysis tooling.
+message: "Please cite the repository version/commit used for the reported experiments."
+authors:
+  - family-names: "Kumar"
+    given-names: "Gourav"
+repository-code: "https://github.com/PallaviSri-droid/zero_watermarking"
+license: "MIT"
+version: "0.2.1"
+date-released: "2026-09-12"
+keywords:
+  - zero-watermarking
+  - medical-image-security
+  - robust-hashing
+  - collision-analysis
+  - multi-objective-optimization
+  - reproducible-research
