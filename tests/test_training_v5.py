@@ -33,7 +33,7 @@ def test_objective_terms_current_version_shape_and_finite():
         "consistency",
         "binary_collision",
     }
-    assert CAP_ZW_VERSION == "CAP-ZW-v8"
+    assert CAP_ZW_VERSION == "CAP-ZW-v9"
     assert set(terms) == expected
     assert all(torch.isfinite(value).item() for value in terms.values())
     assert all(value.ndim == 0 for value in terms.values())
