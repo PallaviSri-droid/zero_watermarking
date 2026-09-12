@@ -13,12 +13,11 @@ from zero_watermarking.synthetic import make_dataset
 from zero_watermarking.training import CAPZWHashNet, PairAttackDataset, TrainConfig, train_cap_zw
 
 
-# Names must match zero_watermarking.attacks.ATTACKS exactly.
 DEFAULT_ATTACKS = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compound")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Train CAP-ZW v3 with collision-memory and MGDA objectives.")
+    parser = argparse.ArgumentParser(description="Train CAP-ZW v4 with balanced collision-memory and MGDA objectives.")
     parser.add_argument("--manifest", default="", help="Medical CSV manifest. Omit for synthetic smoke training.")
     parser.add_argument("--split", default="train_val", help="Manifest split used for training.")
     parser.add_argument("--images", type=int, default=64, help="Synthetic images when --manifest is omitted.")
@@ -29,17 +28,19 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--margin", type=float, default=0.30)
-    parser.add_argument("--memory-size", type=int, default=2048, help="Cross-batch hash memory size.")
+    parser.add_argument("--memory-size", type=int, default=2048)
+    parser.add_argument("--memory-warmup", type=int, default=256)
     parser.add_argument("--mgda-steps", type=int, default=25)
+    parser.add_argument("--topk-negatives", type=int, default=8)
+    parser.add_argument("--diversity-target", type=float, default=0.22)
+    parser.add_argument("--temperature", type=float, default=0.08)
+    parser.add_argument("--collision-power", type=float, default=2.0)
     parser.add_argument("--checkpoint", default="experiments/checkpoints/cap_zw.pt")
     parser.add_argument("--history", default="experiments/results/cap_zw_training_history.csv")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     args = parser.parse_args()
 
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = args.device
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu" if args.device == "auto" else args.device
     if device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but is not available in this PyTorch installation.")
 
@@ -59,20 +60,19 @@ def main() -> int:
         labels = np.arange(len(images), dtype=np.int64)
 
     dataset = PairAttackDataset(images, labels, attack_names=DEFAULT_ATTACKS)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=(device == "cuda"),
-    )
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=(device == "cuda"))
     config = TrainConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         margin=args.margin,
         memory_size=args.memory_size,
+        memory_warmup=args.memory_warmup,
         mgda_steps=args.mgda_steps,
+        topk_negatives=args.topk_negatives,
+        diversity_target=args.diversity_target,
+        temperature=args.temperature,
+        collision_power=args.collision_power,
         nbits=args.bits,
         device=device,
     )
@@ -84,7 +84,8 @@ def main() -> int:
     pd.DataFrame(history).to_csv(history_path, index=False)
 
     print(f"Training complete: epochs={len(history)} images={len(images)} bits={args.bits} device={device}")
-    print(f"memory_size={args.memory_size} mgda_steps={args.mgda_steps}")
+    print(f"version=CAP-ZW-v4 memory_size={args.memory_size} warmup={args.memory_warmup} topk={args.topk_negatives}")
+    print(f"diversity_target={args.diversity_target} temperature={args.temperature} mgda_steps={args.mgda_steps}")
     print(f"checkpoint={Path(args.checkpoint).resolve()}")
     print(f"history={history_path.resolve()}")
     return 0
