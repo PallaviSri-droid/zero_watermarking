@@ -30,7 +30,7 @@ DEFAULT_ATTACK_GRID = (
 
 def load_model(checkpoint: Path, bits: int, device: str) -> CAPZWHashNet:
     model = CAPZWHashNet(nbits=bits)
-    payload = torch.load(checkpoint, map_location=device)
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
     state = payload.get("model", payload)
     model.load_state_dict(state)
     model.to(device).eval()
@@ -38,7 +38,7 @@ def load_model(checkpoint: Path, bits: int, device: str) -> CAPZWHashNet:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Evaluate a trained CAP-ZW model on a held-out medical split.")
+    parser = argparse.ArgumentParser(description="Evaluate CAP-ZW on a held-out medical split.")
     parser.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
     parser.add_argument("--split", default="test")
     parser.add_argument("--checkpoint", default="experiments/checkpoints/cap_zw.pt")
@@ -54,7 +54,7 @@ def main() -> int:
         raise SystemExit("CUDA was requested but is not available.")
 
     frame = validate_manifest(load_manifest(args.manifest))
-    frame = frame[frame.exists].reset_index(drop=True)
+    frame = frame[frame["exists"]].reset_index(drop=True)
     if "split" in frame.columns:
         frame = frame[frame["split"].astype(str).eq(args.split)].reset_index(drop=True)
     frame = frame.head(args.limit)
@@ -76,7 +76,10 @@ def main() -> int:
             clean_bank[row.image_id] = clean_hash
             attacked_bank[row.image_id] = {}
             for index, (attack_name, kwargs) in enumerate(DEFAULT_ATTACK_GRID):
-                attacked = ATTACKS[attack_name](image, **kwargs)
+                params = dict(kwargs)
+                if attack_name in {"gaussian_noise", "compound"}:
+                    params["seed"] = int(params.get("seed", 0)) + index
+                attacked = ATTACKS[attack_name](image, **params)
                 ax = torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None, None]).to(device)
                 attacked_hash = model(ax, hard=True).round().to(torch.uint8).cpu().numpy()[0]
                 attacked_bank[row.image_id][f"{attack_name}_{index}"] = attacked_hash
@@ -106,7 +109,21 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([summary]).to_csv(out / "summary.csv", index=False)
     pd.DataFrame(result["details"], columns=["image_id", "attack", "hamming", "nc"]).to_csv(out / "attack_details.csv", index=False)
+
+    # Collision diagnostics: retain exact and near-duplicate clean hashes.
+    ids = sorted(clean_bank)
+    pairs: list[dict[str, object]] = []
+    for i, left in enumerate(ids):
+        for right in ids[i + 1 :]:
+            distance = float(np.mean(clean_bank[left] != clean_bank[right]))
+            if distance <= 0.05:
+                pairs.append({"image_a": left, "image_b": right, "hamming": distance, "exact_collision": distance == 0.0})
+    collision_frame = pd.DataFrame(pairs, columns=["image_a", "image_b", "hamming", "exact_collision"])
+    collision_frame.to_csv(out / "collision_pairs.csv", index=False)
+
     print(pd.Series(summary).to_string())
+    print(f"near_collision_pairs={len(collision_frame)}")
+    print(f"exact_collision_pairs={int(collision_frame['exact_collision'].sum()) if not collision_frame.empty else 0}")
     print(f"Results written to {out.resolve()}")
     return 0
 
