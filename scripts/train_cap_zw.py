@@ -18,7 +18,7 @@ DEFAULT_ATTACKS = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compo
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Train CAP-ZW with collision-aware MGDA objectives.")
+    parser = argparse.ArgumentParser(description="Train CAP-ZW v3 with collision-memory and MGDA objectives.")
     parser.add_argument("--manifest", default="", help="Medical CSV manifest. Omit for synthetic smoke training.")
     parser.add_argument("--split", default="train_val", help="Manifest split used for training.")
     parser.add_argument("--images", type=int, default=64, help="Synthetic images when --manifest is omitted.")
@@ -29,6 +29,8 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--margin", type=float, default=0.30)
+    parser.add_argument("--memory-size", type=int, default=2048, help="Cross-batch hash memory size.")
+    parser.add_argument("--mgda-steps", type=int, default=25)
     parser.add_argument("--checkpoint", default="experiments/checkpoints/cap_zw.pt")
     parser.add_argument("--history", default="experiments/results/cap_zw_training_history.csv")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -69,6 +71,8 @@ def main() -> int:
         batch_size=args.batch_size,
         lr=args.lr,
         margin=args.margin,
+        memory_size=args.memory_size,
+        mgda_steps=args.mgda_steps,
         nbits=args.bits,
         device=device,
     )
@@ -80,6 +84,7 @@ def main() -> int:
     pd.DataFrame(history).to_csv(history_path, index=False)
 
     print(f"Training complete: epochs={len(history)} images={len(images)} bits={args.bits} device={device}")
+    print(f"memory_size={args.memory_size} mgda_steps={args.mgda_steps}")
     print(f"checkpoint={Path(args.checkpoint).resolve()}")
     print(f"history={history_path.resolve()}")
     return 0
