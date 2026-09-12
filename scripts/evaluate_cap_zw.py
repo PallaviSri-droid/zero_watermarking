@@ -9,7 +9,6 @@ import torch
 
 from zero_watermarking.attacks import ATTACKS
 from zero_watermarking.datasets import load_image, load_manifest, validate_manifest
-from zero_watermarking.learned import HashEncoder
 from zero_watermarking.metrics import bit_balance, bit_entropy, mean_abs_corr, evaluate_hash_bank
 from zero_watermarking.training import CAPZWHashNet
 
@@ -17,14 +16,14 @@ from zero_watermarking.training import CAPZWHashNet
 DEFAULT_ATTACK_GRID = (
     ("gaussian_noise", {"sigma": 0.03, "seed": 11}),
     ("gaussian_noise", {"sigma": 0.08, "seed": 17}),
-    ("blur", {"sigma": 1.0}),
-    ("blur", {"sigma": 2.0}),
+    ("gaussian_blur", {"sigma": 1.0}),
+    ("gaussian_blur", {"sigma": 2.0}),
     ("jpeg", {"quality": 70}),
     ("jpeg", {"quality": 40}),
-    ("rotation", {"angle": 5.0}),
-    ("rotation", {"angle": 10.0}),
-    ("crop_resize", {"fraction": 0.90}),
-    ("translation", {"dx": 3, "dy": 2}),
+    ("rotation", {"degrees": 5.0}),
+    ("rotation", {"degrees": 10.0}),
+    ("crop_resize", {"fraction": 0.05}),
+    ("translation", {"pixels": 3}),
     ("compound", {"seed": 23}),
 )
 
@@ -77,12 +76,7 @@ def main() -> int:
             clean_bank[row.image_id] = clean_hash
             attacked_bank[row.image_id] = {}
             for index, (attack_name, kwargs) in enumerate(DEFAULT_ATTACK_GRID):
-                params = dict(kwargs)
-                if attack_name == "gaussian_noise":
-                    params["seed"] = int(params.get("seed", 0)) + index
-                if attack_name == "compound":
-                    params["seed"] = int(params.get("seed", 0)) + index
-                attacked = ATTACKS[attack_name](image, **params)
+                attacked = ATTACKS[attack_name](image, **kwargs)
                 ax = torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None, None]).to(device)
                 attacked_hash = model(ax, hard=True).round().to(torch.uint8).cpu().numpy()[0]
                 attacked_bank[row.image_id][f"{attack_name}_{index}"] = attacked_hash
