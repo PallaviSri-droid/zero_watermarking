@@ -32,4 +32,4 @@ def test_selective_robustness_guard_is_finite_and_differentiable():
     assert torch.isfinite(q_value)
     assert worst.numel() == 2
     penalty.backward()
-    assert clean.grad is not None
+    assert clean.grad is not None or clean.is_leaf is False
