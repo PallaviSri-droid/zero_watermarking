@@ -17,12 +17,16 @@ class AttackSpec:
     values: tuple[float, ...]
 
 
+# Locked main-paper attack grid. Every reproduced method must use these exact
+# attacks/strengths unless a result is explicitly labeled exploratory.
 DEFAULT_ATTACK_GRID: tuple[AttackSpec, ...] = (
-    AttackSpec("gaussian_noise", "sigma", (0.01, 0.03, 0.05, 0.08)),
-    AttackSpec("gaussian_blur", "sigma", (0.5, 1.0, 1.5, 2.0)),
-    AttackSpec("jpeg", "quality", (90.0, 70.0, 50.0, 30.0)),
-    AttackSpec("rotation", "degrees", (1.0, 3.0, 5.0, 10.0)),
-    AttackSpec("crop_resize", "fraction", (0.02, 0.05, 0.10, 0.15)),
+    AttackSpec("gaussian_noise", "sigma", (0.03, 0.08)),
+    AttackSpec("gaussian_blur", "sigma", (1.0, 2.0)),
+    AttackSpec("jpeg", "quality", (70.0, 40.0)),
+    AttackSpec("rotation", "degrees", (5.0, 10.0)),
+    AttackSpec("crop_resize", "fraction", (0.05,)),
+    AttackSpec("translation", "pixels", (3.0,)),
+    AttackSpec("compound", "seed", (23.0,)),
 )
 
 
@@ -31,14 +35,16 @@ def attack_grid(
     specs: tuple[AttackSpec, ...] = DEFAULT_ATTACK_GRID,
     seed: int = 42,
 ) -> dict[str, dict[float, np.ndarray]]:
-    """Generate an attack-strength grid for an identical benchmark protocol."""
+    """Generate the locked attack-strength grid for an identical benchmark protocol."""
     outputs: dict[str, dict[float, np.ndarray]] = {}
     for spec in specs:
         outputs[spec.name] = {}
         for value in spec.values:
-            kwargs = {spec.parameter: value}
+            kwargs: dict[str, float | int] = {spec.parameter: value}
             if spec.name == "compound":
-                kwargs["seed"] = seed
+                kwargs["seed"] = int(value) + int(seed) % 100000
+            elif spec.name in {"gaussian_noise"}:
+                kwargs["seed"] = int(seed)
             outputs[spec.name][value] = ATTACKS[spec.name](image, **kwargs)
     return outputs
 
