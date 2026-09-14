@@ -69,17 +69,7 @@ The repository deliberately avoids uncontrolled hand-tuned version chasing. See 
 
 ## LogPolar + DINOv2 + MRELBP comparison baseline
 
-To directly benchmark the approach used by your peer group, the repository now includes an independently reproducible **LogPolar+DINOv2+MRELBP** fusion baseline.
-
-### Why these components
-
-**DINO/DINOv2:** self-supervised Vision Transformer representations provide strong generic visual features without task-specific labels. The DINOv2 paper reports robust general-purpose visual features from large-scale self-supervised training. [DINO, Caron et al., 2021](https://arxiv.org/abs/2104.14294); [DINOv2, Oquab et al., 2023](https://arxiv.org/abs/2304.07193).
-
-**Log-polar representation:** log-polar coordinates convert rotation and scale changes into shifts, enabling Fourier-magnitude or other shift-insensitive descriptors to obtain rotation/scale robustness. See the log-polar invariant recognition literature, including the Log-Polar Magnitude descriptor and later invariant pattern-recognition formulations. [Log-Polar Magnitude](https://pmc.ncbi.nlm.nih.gov/articles/PMC5708636/).
-
-**MRELBP:** Median Robust Extended Local Binary Pattern replaces raw-pixel comparisons with regional-median comparisons and uses multiscale local patterns to capture microstructure and macrostructure while improving robustness to noise and rotation. [Liu et al., IEEE TIP 2016, DOI:10.1109/TIP.2016.2522378](https://pubmed.ncbi.nlm.nih.gov/26829791/).
-
-The fusion implementation in `src/zero_watermarking/logpolar_dino_mrelbp.py` is a **benchmark implementation of the combined idea**, not copied code and not a claim that the exact fusion is a published method.
+To directly benchmark the competing design, the repository includes an independently reproducible **LogPolar+DINOv2+MRELBP** fusion baseline.
 
 ### Fusion pipeline
 
@@ -87,9 +77,7 @@ The fusion implementation in `src/zero_watermarking/logpolar_dino_mrelbp.py` is 
 Medical image
      │
      ├── DINOv2 ViT-S/14 global feature
-     │
      ├── Log-polar → Fourier magnitude feature
-     │
      └── Multiscale median local-pattern feature (MRELBP-style)
                  │
                  ▼
@@ -111,9 +99,9 @@ Medical image
           binary zero-hash
 ```
 
-The fitted scaler/PCA/projection are learned only on the fitting split; the held-out test split is never used to fit them.
+The implementation is a benchmark fusion of established descriptor families; it is not a claim that this exact fusion was previously published. Scaler/PCA are fitted only on the fitting split and never on the locked test set.
 
-### Run the comparison
+Run it with the locked attack grid:
 
 ```bash
 python scripts/benchmark_logpolar_dino_mrelbp.py \
@@ -123,14 +111,10 @@ python scripts/benchmark_logpolar_dino_mrelbp.py \
   --fit-limit 1000 \
   --limit 200 \
   --size 128 \
-  --bits 128 \
+  --bits 256 \
   --seed 42 \
   --device auto
 ```
-
-The script evaluates the hybrid using the same CAP-ZW metric implementation, including NC/BER, AUC/EER, inter/intra Hamming distances, collision rates and tail separation.
-
-**Reproducibility note:** the first run downloads DINOv2 ViT-S/14 weights through PyTorch Hub. Cache the model weights locally and record the exact environment/checkpoint metadata with the experiment. DINOv2's official implementation is available from Meta's `facebookresearch/dinov2` repository.
 
 ## Reproducible experiment sequence
 
@@ -142,17 +126,15 @@ python -m pip install -e .
 python -m pytest -q
 ```
 
+The repository now pins conservative dependency ranges and explicitly limits pytest discovery to `tests/`, so experiment scripts under `scripts/` are not collected as tests.
+
 ### 2. Dataset
 
 The primary real-data benchmark is **NIH ChestX-ray14**. Keep raw images outside Git and construct a manifest containing image paths plus patient/group identifiers. The test split must remain locked during model selection.
 
-The preparation utility is:
-
 ```bash
 python scripts/prepare_nih_chestxray14.py --max-images 5000
 ```
-
-For Kaggle authentication, use the credential mechanism supported by the installed Kaggle CLI; never commit credentials or paste API keys into source files.
 
 ### 3. Train the locked candidate
 
@@ -169,7 +151,30 @@ python scripts/train_cap_zw_final.py \
   --device auto
 ```
 
-### 4. Run the five-seed selection benchmark
+### 4. Common classical/deep benchmark
+
+```bash
+python scripts/run_full_benchmark.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --split test \
+  --limit 200 \
+  --size 128 \
+  --bits 256
+```
+
+This benchmark uses the locked common attack grid and reports robustness, discriminability, collision rates, tail separation and hash-quality statistics for DCT-Mean, DCT-Balanced, Edge-DCT and optional pretrained deep baselines.
+
+### 5. Compare retained summaries
+
+```bash
+python scripts/compare_cap_zw_vs_hybrid.py \
+  --input "LogPolar+DINOv2+MRELBP=experiments/results/logpolar_dino_mrelbp/summary_seed_42.csv" \
+  --input "CAP-ZW=experiments/results/cap_zw_test/summary.csv"
+```
+
+Additional baseline summaries can be added with more `--input LABEL=PATH` arguments. The comparison tool rejects incompatible split/image-count/hash-length/attack-grid metadata rather than silently comparing different protocols.
+
+### 6. Five-seed selection benchmark
 
 ```bash
 python scripts/run_cap_zw_multiseed.py \
@@ -187,33 +192,17 @@ python scripts/run_cap_zw_multiseed.py \
 
 Shortlisted configurations require five independent seeds for publication statistics; two seeds are reserved for early smoke screening.
 
-### 5. Evaluate the locked test set
-
-```bash
-python scripts/evaluate_cap_zw.py \
-  --manifest data/manifests/medical_manifest.csv \
-  --split test \
-  --checkpoint experiments/checkpoints/cap_zw_final_seed42.pt \
-  --limit 200 \
-  --size 128 \
-  --bits 256
-```
-
-Do not tune the final test threshold after seeing the test results.
-
 ## Publication analysis
 
-Use the analysis notebooks to generate the paper tables and figures only from retained seed-level outputs. Report mean, standard deviation and 95% Student-t confidence intervals across seeds. Always retain the negative-pair denominator for collision statistics.
+Use the analysis notebooks to generate paper tables and figures only from retained seed-level outputs. Report mean, standard deviation and 95% confidence intervals across seeds. Always retain the negative-pair denominator for collision statistics.
 
 For the external feature-fusion baseline, do not compare literature classification accuracy with CAP-ZW watermarking metrics. The proper comparison is an end-to-end hash/verification benchmark under the same images, attacks, hash length and evaluator.
-
-The paper-ready minimum figure set is documented in `reports/journal_protocol.md`.
 
 ## Reproducibility
 
 Every reported result should be traceable to:
 
-`commit → configuration → seed → manifest → checkpoint → evaluator → attack grid → metrics`
+`commit → configuration → seed → manifest → checkpoint/model fit state → evaluator → attack grid → metrics`
 
 The project intentionally does not version raw datasets, checkpoints or large experiment outputs.
 
