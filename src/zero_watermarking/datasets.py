@@ -16,6 +16,7 @@ class ImageRecord:
     group_id: str
     modality: str = "unknown"
     label: str = "unknown"
+    split: str = "unknown"
 
 
 def load_manifest(path: str | Path) -> list[ImageRecord]:
@@ -23,6 +24,8 @@ def load_manifest(path: str | Path) -> list[ImageRecord]:
 
     Empty/comment-only lines are ignored so the checked-in template can be
     edited safely. `group_id` should identify a patient/study when available.
+    The optional `split` column is preserved because the publication benchmark
+    must be able to filter the locked test partition deterministically.
     """
     frame = pd.read_csv(path, comment="#")
     required = {"path", "image_id", "group_id"}
@@ -39,6 +42,7 @@ def load_manifest(path: str | Path) -> list[ImageRecord]:
                 group_id=str(row.group_id),
                 modality=str(getattr(row, "modality", "unknown")),
                 label=str(getattr(row, "label", "unknown")),
+                split=str(getattr(row, "split", "unknown")),
             )
         )
     return records
@@ -58,14 +62,19 @@ def validate_manifest(records: Iterable[ImageRecord], root: str | Path | None = 
             "group_id": record.group_id,
             "modality": record.modality,
             "label": record.label,
+            "split": record.split,
         })
     frame = pd.DataFrame(rows)
     if frame.empty:
-        raise ValueError("Manifest contains no records. Add real image rows first.")
+        raise ValueError("Manifest contains no records. Add real medical-image rows first.")
     if frame["image_id"].duplicated().any():
         raise ValueError("Manifest contains duplicate image_id values")
     if frame["group_id"].astype(str).str.strip().eq("").any():
         raise ValueError("Every record must have a non-empty group_id")
+    if "split" in frame.columns:
+        known = frame["split"].astype(str).str.strip()
+        if known.eq("").any():
+            raise ValueError("Every record must have a non-empty split value when split is present")
     return frame
 
 
