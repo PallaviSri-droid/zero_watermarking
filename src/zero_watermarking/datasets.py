@@ -7,7 +7,6 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from PIL import Image
-from sklearn.model_selection import GroupShuffleSplit
 
 
 @dataclass(frozen=True)
@@ -70,19 +69,77 @@ def validate_manifest(records: Iterable[ImageRecord], root: str | Path | None = 
     return frame
 
 
-def group_split(frame: pd.DataFrame, test_size: float = 0.2, val_size: float = 0.1, seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _group_shuffle_split_indices(
+    frame: pd.DataFrame,
+    test_size: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split rows by group without importing scikit-learn.
+
+    Unique groups are shuffled deterministically and accumulated until their
+    row count is closest to the requested partition size. Whole groups are
+    always kept together, preserving patient/study-level leakage protection.
+    """
+    if not 0 < test_size < 1:
+        raise ValueError("test_size must be in (0, 1)")
+
+    groups = frame["group_id"].astype(str).to_numpy()
+    unique_groups = np.unique(groups)
+    if len(unique_groups) < 2:
+        raise ValueError("At least two unique groups are required for splitting")
+
+    rng = np.random.default_rng(seed)
+    shuffled = unique_groups.copy()
+    rng.shuffle(shuffled)
+
+    group_sizes = {group: int(np.count_nonzero(groups == group)) for group in unique_groups}
+    target_rows = max(1, int(round(len(frame) * test_size)))
+
+    selected: list[str] = []
+    selected_rows = 0
+    remaining = list(shuffled)
+    while remaining and (selected_rows < target_rows or not selected):
+        best_index = min(
+            range(len(remaining)),
+            key=lambda i: abs(selected_rows + group_sizes[remaining[i]] - target_rows),
+        )
+        group = remaining.pop(best_index)
+        selected.append(group)
+        selected_rows += group_sizes[group]
+        if selected_rows >= target_rows:
+            break
+
+    selected_set = set(selected)
+    test_mask = np.array([group in selected_set for group in groups], dtype=bool)
+    test_idx = np.flatnonzero(test_mask)
+    train_idx = np.flatnonzero(~test_mask)
+    if len(train_idx) == 0 or len(test_idx) == 0:
+        raise RuntimeError("Grouped split produced an empty partition")
+    return train_idx, test_idx
+
+
+def group_split(
+    frame: pd.DataFrame,
+    test_size: float = 0.2,
+    val_size: float = 0.1,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if not 0 < test_size < 1 or not 0 < val_size < 1 or test_size + val_size >= 1:
         raise ValueError("test_size and val_size must be in (0,1) and sum to < 1")
-    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    train_val_idx, test_idx = next(splitter.split(frame, groups=frame["group_id"]))
+
+    train_val_idx, test_idx = _group_shuffle_split_indices(frame, test_size, seed)
     train_val = frame.iloc[train_val_idx].reset_index(drop=True)
     test = frame.iloc[test_idx].reset_index(drop=True)
+
     relative_val = val_size / (1.0 - test_size)
-    splitter2 = GroupShuffleSplit(n_splits=1, test_size=relative_val, random_state=seed + 1)
-    train_idx, val_idx = next(splitter2.split(train_val, groups=train_val["group_id"]))
+    train_idx, val_idx = _group_shuffle_split_indices(train_val, relative_val, seed + 1)
     train = train_val.iloc[train_idx].reset_index(drop=True)
     val = train_val.iloc[val_idx].reset_index(drop=True)
-    if set(train.group_id) & set(val.group_id) or set(train.group_id) & set(test.group_id) or set(val.group_id) & set(test.group_id):
+
+    train_groups = set(train.group_id)
+    val_groups = set(val.group_id)
+    test_groups = set(test.group_id)
+    if train_groups & val_groups or train_groups & test_groups or val_groups & test_groups:
         raise RuntimeError("Grouped split leakage detected")
     return train, val, test
 
