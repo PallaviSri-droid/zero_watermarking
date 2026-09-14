@@ -1,0 +1,1 @@
+Experimental extension only. Keep stable checkpoint as frozen baseline; evaluate candidate under identical 200-image development protocol before promotion.
