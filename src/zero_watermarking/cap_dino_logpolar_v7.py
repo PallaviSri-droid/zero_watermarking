@@ -2,6 +2,16 @@ from __future__ import annotations
 
 """CAP-DINO-LogPolar v7: collision-tail + hard-robustness + anti-dominance fusion.
 
+v7 is a controlled refinement of v6. It keeps the same three branches and frozen
+DINOv2 backbone, but fixes an important optimization problem in v6: the hard
+robustness tail was partly detached, so its quantile/worst-case terms could not
+train the representation. v7 also adds a residual cross-branch mixer and explicit
+per-sample gate anti-dominance constraints so CAP cannot monopolize the fusion.
+
+The individual ingredients (DINOv2, Log-Polar descriptors, STE/binary hashing,
+entropy/balance regularization, hard-negative/memory training) are established.
+The research hypothesis remains the joint collision-aware Pareto formulation and
+its tail-risk evaluation under one locked medical-image benchmark.
 Controlled refinement of v6. The critical v6 issue is that its hard robustness
 quantile/worst-case tail was detached before optimization, so that tail statistic
 was logged but could not provide a gradient. v7 keeps the same branches/backbone,
@@ -32,6 +42,7 @@ class V7Config(V6Config):
     lr: float = 6e-5
     attack_views: int = 11
 
+    # Keep V6's robustness budget, but make the hard tail trainable.
     # Keep v6 robustness but make tail risk trainable.
     robust_target: float = 0.034
     robust_q_target: float = 0.060
@@ -43,6 +54,7 @@ class V7Config(V6Config):
     lambda_robust_hard: float = 1.10
     lambda_robust_tail: float = 1.00
 
+    # Collision-tail / anti-collapse controls inherited conceptually from v12-v14.
     # Controls carried forward from the stronger v12-v14 candidates.
     q05_target: float = 0.10
     q10_target: float = 0.16
@@ -58,6 +70,7 @@ class V7Config(V6Config):
     lambda_balance: float = 0.45
     lambda_decorrelation: float = 0.35
 
+    # Force genuine multi-branch use without making the gate uniformly flat.
     # Stop the CAP branch from becoming the only useful path.
     branch_dropout: float = 0.25
     gate_min_usage: float = 0.18
@@ -68,6 +81,9 @@ class V7Config(V6Config):
     lambda_gate_diversity: float = 0.20
     lambda_gate_dominance: float = 0.25
 
+    # Residual cross-branch interaction path.
+    mixer_dropout: float = 0.08
+    mixer_scale_init: float = 0.20
     # Complement the convex mixture with controlled branch interactions.
     mixer_dropout: float = 0.08
     mixer_scale_init: float = -1.20
@@ -75,6 +91,7 @@ class V7Config(V6Config):
 
 
 class CAPDinoLogPolarV7(CAPDinoLogPolarV6):
+    """v7 with a residual branch-interaction mixer and stronger tail controls."""
     """v7 with residual branch interaction and stronger collision/robustness tails."""
 
     def __init__(self, config: V7Config | None = None) -> None:
@@ -90,6 +107,14 @@ class CAPDinoLogPolarV7(CAPDinoLogPolarV6):
         ).to(self.runtime_device)
         self.mixer_scale = nn.Parameter(torch.tensor(float(c.mixer_scale_init)))
 
+    def _fused_v7(self, cap: Tensor, dino: Tensor, lp: Tensor, gates: Tensor) -> Tensor:
+        weighted = torch.cat(
+            [gates[:, 0:1] * cap, gates[:, 1:2] * dino, gates[:, 2:3] * lp], dim=-1
+        )
+        convex = weighted[:, : cap.shape[1]] + weighted[:, cap.shape[1]: 2 * cap.shape[1]] + weighted[:, 2 * cap.shape[1]:]
+        interaction = self.branch_mixer(weighted)
+        scale = torch.sigmoid(self.mixer_scale)
+        return convex + scale * interaction
     @staticmethod
     def _gated_concat(cap: Tensor, dino: Tensor, lp: Tensor, gates: Tensor) -> Tensor:
         return torch.cat(
@@ -111,6 +136,8 @@ class CAPDinoLogPolarV7(CAPDinoLogPolarV6):
         clean_gates = self.gate(clean_cap, clean_dino, clean_lp)
         attacked_gates = self.gate(attacked_cap, attacked_dino, attacked_lp)
         shared_gates, branch_mask = self._shared_branch_dropout(clean_gates)
+        clean_fused = self._fused_v7(clean_cap, clean_dino, clean_lp, shared_gates)
+        attacked_fused = self._fused_v7(attacked_cap, attacked_dino, attacked_lp, shared_gates.detach())
         clean_fused, clean_interaction = self._fused_v7(clean_cap, clean_dino, clean_lp, shared_gates)
         attacked_fused, attacked_interaction = self._fused_v7(attacked_cap, attacked_dino, attacked_lp, shared_gates.detach())
         clean_logits = self.fusion(clean_fused)
@@ -137,6 +164,14 @@ class CAPDinoLogPolarV7(CAPDinoLogPolarV6):
     def forward(self, x: Tensor, hard: bool = False) -> Tensor:
         cap, dino, lp = self.encode_branches(x)
         gates = self.gate(cap, dino, lp)
+        fused = self._fused_v7(cap, dino, lp, gates)
+        return self.quantizer(self.fusion(fused), hard=hard)
+
+
+def _hard_robustness_terms(clean: Tensor, attacked: Tensor, config: V7Config) -> tuple[Tensor, Tensor, Tensor]:
+    """Fully trainable hard-code tail; do not detach quantile/top-k values."""
+    d = (clean - attacked).abs().mean(dim=1)
+    d = _finite(d, 2.0)
         fused, _ = self._fused_v7(cap, dino, lp, gates)
         return self.quantizer(self.fusion(fused), hard=hard)
         weighted = self._gated_concat(cap, dino, lp, gates)
@@ -381,6 +416,7 @@ def _binary_collision(codes: Tensor, labels: Tensor, target: float, topk: int) -
     fill = torch.where(torch.isfinite(neg), neg, torch.full_like(neg, 2.0))
     kk = min(max(int(topk), 1), fill.shape[1])
     vals = torch.topk(fill, kk, largest=False, dim=1).values
+    return (0.70 * F.relu(float(target) - vals[:, 0]).pow(2) + 0.30 * F.relu(float(target) - vals).pow(2).mean(dim=1)).mean().clamp_max(1.0)
     vals = torch.topk(fill, kk, largest=False).values
     tail = F.relu(float(target) - vals[:, 0]).pow(2)
     mass = F.relu(float(target) - vals).pow(2).mean(dim=1)
@@ -417,6 +453,28 @@ def v7_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: Tensor |
     soft_q_loss = F.softplus((soft_q - config.robust_q_target) / config.robust_softness).mul(config.robust_softness).clamp_max(2.0)
     hard_rob, hard_tail, hard_d = _hard_robustness_terms(clean_h, attacked_h, config)
 
+    branch_cons = torch.stack([_safe_cosine_loss(a, b) for a, b in zip(pair["clean_branches"], pair["attacked_branches"])])
+    branch_consistency = branch_cons.mean()
+    gate_consistency = F.mse_loss(pair["clean_gates"], pair["attacked_gates"]).clamp_max(2.0)
+
+    tail, discrimination, inter = _pairwise_tail_loss(pair_s, pair_labels, config.q05_target, config.q10_target)
+    hard_tail_collision = _binary_collision(pair_h, pair_labels, config.binary_collision_target, config.topk_negatives)
+
+    if memory_codes is not None and memory_codes.numel():
+        mem = memory_codes.detach().clamp(0.0, 1.0)
+        md = _normalized_hamming(pair_h, mem)
+        if memory_labels is not None:
+            md = md.masked_fill(pair_labels[:, None].eq(memory_labels.detach()[None, :]), float("inf"))
+        mf = torch.where(torch.isfinite(md), md, torch.full_like(md, 2.0))
+        kk = min(max(int(config.topk_negatives), 1), mf.shape[1])
+        mv = torch.topk(mf, kk, largest=False, dim=1).values
+        memory_collision = (0.70 * F.relu(config.binary_collision_target - mv[:, 0]).pow(2) + 0.30 * F.relu(config.binary_collision_target - mv).pow(2).mean(dim=1)).mean()
+    else:
+        memory_collision = clean_s.new_zeros(())
+
+    hard_entropy, hard_balance, entropy_obs, balance_obs = _hard_bit_constraints(pair_h, config.entropy_target, config.balance_target)
+    p = pair_h.mean(dim=0).clamp(1e-5, 1 - 1e-5)
+    soft_entropy = -(p * torch.log2(p) + (1 - p) * torch.log2(1 - p)).mean()
     branch_consistency = torch.stack([
         _safe_cosine_loss(a, b) for a, b in zip(pair["clean_branches"], pair["attacked_branches"])
     ]).mean()
@@ -435,6 +493,23 @@ def v7_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: Tensor |
     z = centered / std
     corr = (z.T @ z) / max(pair_h.shape[0], 1)
     eye = torch.eye(corr.shape[0], device=corr.device, dtype=corr.dtype)
+    decor = ((corr - eye) * (1 - eye)).pow(2).mean().clamp_max(2.0)
+
+    g = pair["clean_gates"]
+    mean_g = g.mean(dim=0)
+    gate_usage = (F.relu(config.gate_min_usage - mean_g).pow(2) + F.relu(mean_g - config.gate_max_usage).pow(2)).mean()
+    gate_std = g.std(dim=0, unbiased=False).mean()
+    gate_diversity = F.relu(config.gate_std_target - gate_std).pow(2)
+    gate_dominance = F.relu(g.max(dim=1).values - config.gate_row_max_target).pow(2).mean()
+
+    # Match the attack routing to the clean routing without allowing attacked features to
+    # rewrite the shared route. This preserves routing identity under perturbations.
+    gate_route_loss = gate_consistency + gate_dominance
+
+    # The mixer should not invent an attack-specific representation.
+    clean_weighted = pair["shared_gates"] * torch.cat(pair["clean_branches"], dim=1)
+    attacked_weighted = pair["shared_gates"].detach() * torch.cat(pair["attacked_branches"], dim=1)
+    mixer_consistency = _safe_cosine_loss(clean_weighted, attacked_weighted)
     decor = ((corr - eye) * (1.0 - eye)).pow(2).mean().clamp_max(2.0)
 
     gates = pair["clean_gates"]
@@ -454,6 +529,11 @@ def v7_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: Tensor |
         + config.lambda_robust_hard * hard_rob
         + config.lambda_robust_tail * hard_tail
         + config.lambda_branch_consistency * branch_consistency
+        + config.lambda_gate_consistency * gate_route_loss
+        + config.lambda_attack_consistency * gate_consistency
+        + config.lambda_discrimination * discrimination
+        + config.lambda_tail * tail
+        + config.lambda_binary_collision * (0.70 * hard_tail_collision + 0.30 * memory_collision)
         + config.lambda_gate_consistency * (gate_consistency + gate_dominance)
         + config.lambda_attack_consistency * gate_consistency
         + config.lambda_discrimination * discrimination
@@ -467,6 +547,9 @@ def v7_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: Tensor |
         + config.lambda_gate_dominance * gate_dominance
         + config.lambda_mixer_consistency * mixer_consistency
     )
+    loss = torch.nan_to_num(loss, nan=10.0, posinf=10.0, neginf=10.0).clamp_max(10.0)
+
+    terms = {
     loss = torch.nan_to_num(loss, nan=10.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
     terms = {
@@ -479,10 +562,9 @@ def v7_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: Tensor |
         "robustness_hard_tail": hard_tail,
         "branch_consistency": branch_consistency,
         "gate_consistency": gate_consistency,
-        "attack_consistency": gate_consistency,
         "discrimination": discrimination,
         "tail": tail,
-        "binary_collision": 0.70 * hard_collision + 0.30 * memory_collision,
+        "binary_collision": (0.70 * hard_tail_collision + 0.30 * memory_collision),
         "entropy": 0.5 * hard_entropy + 0.5 * F.relu(config.entropy_target - soft_entropy).pow(2),
         "balance": 0.5 * hard_balance + 0.5 * F.relu(soft_balance - config.balance_target).pow(2),
         "decorrelation": decor,
@@ -493,21 +575,13 @@ def v7_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: Tensor |
         "observed_entropy": entropy_obs,
         "observed_balance": balance_obs,
         "observed_robustness": soft_d.mean().detach(),
-        "observed_hard_robustness": hard_d.detach().mean(),
+        "observed_hard_robustness": hard_d.mean().detach(),
         "observed_gate_std": gate_std.detach(),
-        "observed_gate_max": gates.max(dim=1).values.detach().mean(),
+        "observed_gate_max": g.max(dim=1).values.mean().detach(),
         "observed_q05": torch.quantile(inter.detach(), 0.05) if inter.numel() else clean_s.new_tensor(0.0),
         "observed_q10": torch.quantile(inter.detach(), 0.10) if inter.numel() else clean_s.new_tensor(0.0),
     }
     return loss, terms
-        "observed_entropy": entropy_obs,
-        "observed_balance": balance_obs,
-        "observed_robustness": soft_d.mean().detach(),
-        "observed_hard_robustness": hard_d.mean().detach(),
-        "observed_gate_std": gate_std.detach(),
-        "observed_gate_max": gates.max(dim=1).values.mean().detach(),
-        "mixer_consistency": mixer_consistency,
-    }
 
 
 __all__ = ["CAP_DINO_LP_V7_VERSION", "V7Config", "CAPDinoLogPolarV7", "v7_objective"]
