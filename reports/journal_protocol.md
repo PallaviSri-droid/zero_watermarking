@@ -1,90 +1,50 @@
 # Journal-Grade Experimental Protocol
 
 ## 1. Research question
-
 CAP-ZW tests whether a **collision-aware multi-objective zero-watermarking formulation** can improve the robustness/discriminability trade-off for medical images while reducing cross-image hash collisions under a common evaluation protocol.
 
 The scientific contribution is the formulation and evidence around collision-aware optimization/evaluation. Individual ingredients such as STE/BEMQ, balanced hashing, contrastive objectives, BCH-style coding, CNN features, memory-bank mining or MGDA-style optimization are not claimed as novel by themselves.
 
-## 2. Controlled comparison
+## 2. Controlled comparison contract
 
-All methods compared in the main table must use the same:
+Every method in the main table must use the same:
 
 - patient/group-level split;
 - image preprocessing and resolution;
 - hash length;
 - watermark length and verification rule;
-- attack types and strengths;
-- negative-pair sampling/evaluation set;
-- metric implementation and thresholding rule.
+- locked attack grid;
+- negative-pair evaluation set/design;
+- metric implementation and thresholding rule;
+- reported evaluation image count.
 
 Literature-reported values and independently reproduced values must remain in separate tables.
 
-## 3. Baseline set
+## 3. Baseline and competitor set
 
-The minimum safe classical comparison is:
+### Safe classical baselines
 
 1. DCT-Mean
 2. DCT-Balanced
 3. Edge-DCT
 
-The benchmark now also contains a reproducible feature-fusion baseline:
+KAZE-DCT variants are not treated as independent evidence when the runtime lacks a true KAZE implementation and the code falls back to DCT.
 
-4. **LogPolar+DINOv2+MRELBP**
+### Feature-fusion competitor
 
-This is implemented independently in `src/zero_watermarking/logpolar_dino_mrelbp.py` and evaluated by `scripts/benchmark_logpolar_dino_mrelbp.py` using the same hash/attack/metric evaluator. It is a composite benchmark baseline, not a claim that the exact fusion is a previously published method.
+**LogPolar+DINOv2+MRELBP** is implemented as a reproducible hybrid benchmark. It combines established descriptor families rather than claiming the fusion itself is previously published or novel:
 
-DINO/DINOv2 is used as an established self-supervised visual representation; the original DINO work introduced self-distillation with Vision Transformers, while DINOv2 scaled this family to robust general visual features. See Caron et al. (2021), https://arxiv.org/abs/2104.14294 and Oquab et al. (2023), https://arxiv.org/abs/2304.07193.
+- frozen DINOv2 ViT-S/14 global features;
+- log-polar Fourier-magnitude descriptor;
+- practical MRELBP-style multiscale median local-pattern histograms;
+- train/validation-only standardization and PCA;
+- fixed random sign projection to the target hash length.
 
-Log-polar descriptors are included because log-polar coordinates convert rotation and scaling into shifts and have long been used for invariant recognition; the Log-Polar Magnitude descriptor is one reproducible example: https://pmc.ncbi.nlm.nih.gov/articles/PMC5708636/.
+PCA must be fit only on the training/validation reference set. The locked test set must never influence descriptor fitting.
 
-MRELBP is included because regional-median comparisons provide a multiscale texture descriptor designed to be robust to noise and rotation: Liu et al., IEEE Transactions on Image Processing, 2016, DOI 10.1109/TIP.2016.2522378, https://pubmed.ncbi.nlm.nih.gov/26829791/.
+Learning-based baselines may be added only when their implementation, weights and preprocessing can be reproduced without hidden assumptions.
 
-Learning-based baselines may be added only when their implementation, weights and preprocessing can be reproduced without hidden assumptions. KAZE variants must not be reported as independent baselines when the runtime does not provide a true KAZE implementation; a fallback to another feature extractor is not equivalent to KAZE.
-
-## 4. LogPolar+DINOv2+MRELBP baseline protocol
-
-The fusion baseline uses:
-
-```text
-image
-  ├── frozen DINOv2 ViT-S/14 global feature
-  ├── log-polar → Fourier-magnitude descriptor
-  └── multiscale median local-pattern (MRELBP-style) descriptor
-             ↓
-      block normalization
-             ↓
-       concatenation
-             ↓
-    fit scaler on fit split only
-             ↓
-       fit PCA on fit split only
-             ↓
-      fixed random projection
-             ↓
-        binary hash
-```
-
-The test split is never used to fit the scaler, PCA or projection. DINO weights are cached locally and the exact model/checkpoint identifier must be recorded in the run metadata.
-
-The executable benchmark is:
-
-```bash
-python scripts/benchmark_logpolar_dino_mrelbp.py \
-  --manifest data/manifests/medical_manifest.csv \
-  --fit-split train_val \
-  --split test \
-  --fit-limit 1000 \
-  --limit 200 \
-  --size 128 \
-  --bits 128 \
-  --seed 42 \
-  --device auto
-```
-
-The comparison must use the same negative-pair universe, attack grid, hash length and evaluator as CAP-ZW. Literature classification/recognition accuracy reported for DINO or MRELBP must never be presented as a watermarking result.
-
-## 5. Proposed method
+## 4. Proposed method
 
 The locked development candidate is `CAP-ZW-final-candidate`, combining the empirically useful collision-focused mechanisms from the v9 reference with the selective robustness guard from v11. The candidate is a starting point for controlled selection, not a presumed winner.
 
@@ -99,7 +59,7 @@ The core objective family includes:
 - MGDA-style task balancing;
 - selective worst-fraction robustness protection.
 
-## 6. Primary metrics
+## 5. Primary metrics
 
 ### Robustness
 
@@ -141,7 +101,7 @@ Always print the negative-pair denominator.
 - mean bit entropy ↑
 - mean absolute off-diagonal bit correlation ↓
 
-## 7. NIH ChestX-ray14 protocol
+## 6. NIH ChestX-ray14 protocol
 
 Use patient identifiers as the grouping variable. No patient/study may occur in more than one of train, validation or test. The test split remains locked during model selection.
 
@@ -157,16 +117,23 @@ For every reported run, record:
 - software environment;
 - random seed;
 - checkpoint identifier/hash;
-- attack-grid identifier;
-- baseline descriptor/model version where applicable.
+- attack-grid identifier.
 
-## 8. Fixed attack benchmark
+## 7. Locked attack benchmark
 
-The main benchmark must use one fixed attack grid across candidates. The repository protocol currently includes Gaussian noise, Gaussian blur, JPEG compression, small rotations and crop-resize; translation and deterministic compound attacks are included when the locked experiment configuration specifies them.
+The main paper grid is:
 
-Attack-wise results must be reported in addition to aggregate robustness. The attack grid must not be changed after inspecting test results without labeling the run exploratory.
+- Gaussian noise: sigma 0.03, 0.08
+- Gaussian blur: sigma 1.0, 2.0
+- JPEG: quality 70, 40
+- rotation: 5°, 10°
+- crop-resize: 5%
+- translation: 3 pixels
+- deterministic compound attack
 
-## 9. Training/selection statistics
+The same grid is generated by `zero_watermarking.protocol.DEFAULT_ATTACK_GRID` and must be used by all reproduced methods. Attack-wise results must be reported in addition to aggregate robustness.
+
+## 8. Training/selection statistics
 
 Use independent seeds. The publication target is **5 seeds** for shortlisted configurations; 2 seeds are acceptable only for early smoke screening.
 
@@ -178,7 +145,7 @@ For each metric, retain all seed-level values. Report:
 
 For paired method comparisons, use paired seed comparisons where the design permits and report an effect size. Correct for multiple comparisons when many configurations are tested. Never fabricate a confidence interval from a single run.
 
-## 10. Controlled candidate selection
+## 9. Controlled candidate selection
 
 Starting from the v11 regime, vary one factor at a time before considering a larger factorial search:
 
@@ -190,6 +157,42 @@ Starting from the v11 regime, vary one factor at a time before considering a lar
 Keep architecture, optimizer family, attack grid, data split, evaluator and reporting code fixed while these factors are changed.
 
 The selection decision must be made using training/validation data. The test set is evaluated only after the configuration is locked.
+
+## 10. Reproducible execution
+
+Classical/common benchmark:
+
+```bash
+python scripts/run_full_benchmark.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --split test \
+  --limit 200 \
+  --size 128 \
+  --bits 256
+```
+
+LogPolar+DINOv2+MRELBP competitor:
+
+```bash
+python scripts/benchmark_logpolar_dino_mrelbp.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --fit-split train_val \
+  --split test \
+  --fit-limit 1000 \
+  --limit 200 \
+  --size 128 \
+  --bits 256 \
+  --seed 42 \
+  --device auto
+```
+
+Comparison with the locked contract check:
+
+```bash
+python scripts/compare_cap_zw_vs_hybrid.py \
+  --input "LogPolar+DINOv2+MRELBP=experiments/results/logpolar_dino_mrelbp/summary_seed_42.csv" \
+  --input "CAP-ZW=experiments/results/cap_zw_test/summary.csv"
+```
 
 ## 11. Reproducibility artifacts
 
@@ -210,8 +213,7 @@ The minimum paper-ready set is:
 5. Hash balance, entropy and decorrelation comparison.
 6. Controlled ablation table for selective robustness guard, binary collision pressure, hard-negative mining and MGDA.
 7. Multi-seed mean ± 95% CI table.
-8. **CAP-ZW vs LogPolar+DINOv2+MRELBP paired comparison** under the common protocol.
-9. Runtime, peak-memory and model-size comparison where measurements are collected under the same hardware/software environment.
+8. Competitor comparison including LogPolar+DINOv2+MRELBP under the same contract.
 
 ## 13. Claim discipline
 
