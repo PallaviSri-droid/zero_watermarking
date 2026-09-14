@@ -45,6 +45,7 @@ def main() -> int:
     ap.add_argument("--out", default="experiments/results/cap_dino_logpolar_stable_eval_200")
     ap.add_argument("--limit", type=int, default=200)
     ap.add_argument("--size", type=int, default=128)
+    ap.add_argument("--near-threshold", type=float, default=0.10)
     ap.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     args = ap.parse_args()
 
