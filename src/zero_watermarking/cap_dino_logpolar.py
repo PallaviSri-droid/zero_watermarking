@@ -1,20 +1,6 @@
 from __future__ import annotations
 
-"""CAP + DINOv2 + Log-Polar adaptive fusion.
-
-This candidate uses three complementary branches:
-- CAP: trainable medical-image representation.
-- DINOv2: frozen global visual representation.
-- Log-polar Fourier magnitude: deterministic geometric cue.
-
-The branches are projected to a shared space and fused with a per-image learned
-soft gate. Training uses a collision-aware objective over binary straight-
-through codes plus continuous robustness, lower-tail separation, entropy,
-balance, decorrelation, and gate-collapse regularization.
-
-The combination is a research candidate; the individual components are
-established building blocks and are not claimed as novel individually.
-"""
+"""CAP + DINOv2 + Log-Polar adaptive fusion."""
 
 from dataclasses import dataclass
 
@@ -27,7 +13,7 @@ from .learned import BEMQ, HashEncoder
 from .logpolar_dino_mrelbp import logpolar_fourier_feature
 from .training import _normalized_hamming
 
-CAP_DINO_LP_VERSION = "CAP-DINO-LP-v3"
+CAP_DINO_LP_VERSION = "CAP-DINO-LP-v4"
 
 
 @dataclass
@@ -43,6 +29,8 @@ class FusionConfig:
     dino_weight: float = 1.0
     logpolar_weight: float = 0.85
     gate_temperature: float = 1.0
+    quantizer_temperature: float = 2.0
+    threshold_init_std: float = 0.05
     dropout: float = 0.05
     device: str = "auto"
     freeze_dino: bool = True
@@ -57,12 +45,6 @@ def _resolve_device(name: str) -> torch.device:
     return device
 
 
-def _ste_bits(logits: Tensor) -> Tensor:
-    soft = torch.sigmoid(logits)
-    hard = (soft >= 0.5).to(soft.dtype)
-    return hard.detach() - soft.detach() + soft
-
-
 class AdaptiveTriBranchGate(nn.Module):
     """Per-image mixture weights over CAP, DINOv2 and Log-Polar branches."""
 
@@ -75,8 +57,6 @@ class AdaptiveTriBranchGate(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, 3),
         )
-        # Start from an approximately uniform mixture so no branch is favored
-        # before evidence from the training objective is available.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.temperature = float(max(temperature, 0.1))
@@ -113,7 +93,16 @@ class CAPDinoLogPolar(nn.Module):
             nn.Dropout(self.config.dropout),
             nn.Linear(self.config.fusion_dim, self.config.bits),
         )
-        self.quantizer = BEMQ(self.config.bits, temperature=8.0)
+        self.quantizer = BEMQ(
+            self.config.bits,
+            temperature=self.config.quantizer_temperature,
+        )
+        # Avoid the score == threshold tie at initialization. With the old
+        # zero-threshold/high-temperature setup, p ~= 0.5 could coexist with
+        # an all-one hard code and leave collision separation without useful
+        # gradients at the exact equality point.
+        nn.init.normal_(self.quantizer.thresholds, mean=0.0, std=self.config.threshold_init_std)
+
         self.to(self.runtime_device)
         self.dino.to(self.runtime_device)
 
@@ -129,7 +118,12 @@ class CAPDinoLogPolar(nn.Module):
     @torch.no_grad()
     def dino_features(self, x: Tensor) -> Tensor:
         x = x.repeat(1, 3, 1, 1)
-        x = F.interpolate(x, size=(self.config.dino_size, self.config.dino_size), mode="bicubic", align_corners=False)
+        x = F.interpolate(
+            x,
+            size=(self.config.dino_size, self.config.dino_size),
+            mode="bicubic",
+            align_corners=False,
+        )
         mean = x.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
         std = x.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
         chunks: list[Tensor] = []
@@ -142,7 +136,7 @@ class CAPDinoLogPolar(nn.Module):
         features = np.stack([logpolar_fourier_feature(image, self.config.logpolar_size) for image in images])
         return torch.from_numpy(features).to(x.device, dtype=x.dtype)
 
-    def branch_features(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def branch_features(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor, Tensor]]:
         cap = F.normalize(self.cap_project(self.cap(x, hard=False)), dim=-1) * self.config.cap_weight
         dino = F.normalize(self.dino_project(self.dino_features(x)), dim=-1) * self.config.dino_weight
         logpolar = F.normalize(self.logpolar_project(self.logpolar_features(x)), dim=-1) * self.config.logpolar_weight
@@ -189,12 +183,11 @@ def fusion_objective(
 ) -> dict[str, Tensor]:
     """Robustness + separation + binary collision-aware fusion objective."""
     robustness = (clean - attacked).abs().mean()
-    clean_b = _ste_bits(clean)
-    attacked_b = _ste_bits(attacked)
-    codes = torch.cat([clean_b, attacked_b], dim=0)
-    labs = torch.cat([labels, labels], dim=0)
+
+    labels2 = torch.cat([labels, labels], dim=0)
+    codes = torch.cat([clean, attacked], dim=0)
     distances = _normalized_hamming(codes, codes)
-    negatives = distances.masked_fill(labs[:, None].eq(labs[None, :]), float("inf"))
+    negatives = distances.masked_fill(labels2[:, None].eq(labels2[None, :]), float("inf"))
     finite = negatives[torch.isfinite(negatives)]
     if finite.numel():
         nearest = negatives.min(dim=1).values
@@ -216,7 +209,6 @@ def fusion_objective(
     balance = (balance_p - 0.5).abs().mean()
     decorrelation = _decorrelation_loss(codes)
 
-    # Penalize pathological routing while allowing informative specialization.
     mean_gate = gates.mean(dim=0)
     gate_balance = F.relu(0.20 - mean_gate).pow(2).mean()
     gate_entropy = -(gates.clamp_min(1e-8) * gates.clamp_min(1e-8).log()).sum(dim=1).mean()
@@ -234,7 +226,6 @@ def fusion_objective(
 
 
 def fusion_loss(terms: dict[str, Tensor]) -> Tensor:
-    """Balanced starting scalarization; model selection remains benchmark locked."""
     weights = {
         "robustness": 1.00,
         "discrimination": 0.85,
@@ -249,4 +240,11 @@ def fusion_loss(terms: dict[str, Tensor]) -> Tensor:
     return sum(weights[name] * terms[name] for name in weights)
 
 
-__all__ = ["CAP_DINO_LP_VERSION", "FusionConfig", "AdaptiveTriBranchGate", "CAPDinoLogPolar", "fusion_objective", "fusion_loss"]
+__all__ = [
+    "CAP_DINO_LP_VERSION",
+    "FusionConfig",
+    "AdaptiveTriBranchGate",
+    "CAPDinoLogPolar",
+    "fusion_objective",
+    "fusion_loss",
+]
