@@ -62,11 +62,9 @@ class CAPDinoLogPolarV6(CAPDinoLogPolarV5):
     def _shared_branch_dropout(self, gates: Tensor) -> tuple[Tensor, Tensor]:
         """Drop whole branches jointly for clean/attacked views and renormalize."""
         if not self.training or self.config.branch_dropout <= 0:
-            mask = torch.ones_like(gates)
-            return gates, mask
+            return gates, torch.ones_like(gates)
         p = float(min(max(self.config.branch_dropout, 0.0), 0.45))
         keep = (torch.rand_like(gates) > p).to(gates.dtype)
-        # Keep at least two experts alive per sample.
         for row in range(keep.shape[0]):
             while int(keep[row].sum().item()) < 2:
                 keep[row, torch.randint(0, 3, (), device=gates.device)] = 1.0
@@ -79,8 +77,6 @@ class CAPDinoLogPolarV6(CAPDinoLogPolarV5):
         attacked_cap, attacked_dino, attacked_lp = self.encode_branches(attacked_x)
         clean_gates = self.gate(clean_cap, clean_dino, clean_lp)
         attacked_gates = self.gate(attacked_cap, attacked_dino, attacked_lp)
-
-        # One routing decision and one shared branch mask for the whole positive pair.
         shared_gates, branch_mask = self._shared_branch_dropout(clean_gates)
         clean_fused = self.fuse_from_branches(clean_cap, clean_dino, clean_lp, shared_gates)
         attacked_fused = self.fuse_from_branches(
@@ -108,10 +104,10 @@ class CAPDinoLogPolarV6(CAPDinoLogPolarV5):
 
 def _hard_robustness_tail(clean: Tensor, attacked: Tensor, config: V6Config) -> tuple[Tensor, Tensor, Tensor]:
     """Robustness penalty on STE hard bits, including a worst-case tail."""
-    d = _normalized_hamming(clean, attacked).mean(dim=1) if clean.ndim == 2 else (clean - attacked).abs().mean(dim=1)
+    d = (clean - attacked).abs().mean(dim=1)
     mean_d = d.mean()
     q = torch.quantile(d, float(min(max(config.robust_hard_q, 0.5), 0.99)))
-    k = max(1, int(torch.ceil(torch.tensor(float(d.numel()) * config.robust_hard_tail_fraction)).item()))
+    k = max(1, int(round(float(d.numel()) * config.robust_hard_tail_fraction)))
     worst = torch.topk(d, min(k, d.numel()), largest=True).values.mean()
     beta = max(float(config.robust_softness), 1e-3)
     mean_loss = F.softplus((mean_d - config.robust_hard_target) / beta).mul(beta)
@@ -131,9 +127,6 @@ def v6_objective(
     clean_h, attacked_h = pair["clean_hard"], pair["attacked_hard"]
     clean_g = pair["clean_gates"]
     attacked_g = pair["attacked_gates"]
-
-    # Soft robustness keeps gradients smooth; hard robustness constrains the
-    # representation actually used for watermark matching.
     soft_d = (clean_s - attacked_s).abs().mean(dim=1)
     soft_mean = soft_d.mean()
     soft_q = torch.quantile(soft_d, 0.90)
@@ -164,7 +157,6 @@ def v6_objective(
         discrimination = clean_s.new_zeros(())
         tail = clean_s.new_zeros(())
 
-    # Binary collision objective sees the hard representation used by the evaluator.
     codes_h = torch.cat([clean_h, attacked_h], dim=0)
     h_labels = torch.cat([labels, labels], dim=0)
     hdist = _normalized_hamming(codes_h, codes_h)
@@ -200,8 +192,6 @@ def v6_objective(
         + F.relu(mean_gate - config.gate_max_usage).pow(2).mean()
     )
     gate_diversity = F.relu(config.gate_std_target - gate_std).pow(2)
-
-    # Penalize large gate movement under attack, plus branch-specific attack drift.
     attacked_shift = torch.stack([
         (a - b).pow(2).mean(dim=1).sqrt().mean() for a, b in zip(clean_br, attacked_br)
     ]).mean()
@@ -225,12 +215,13 @@ def v6_objective(
         "observed_entropy": entropy.detach(),
         "observed_balance": balance.detach(),
         "observed_robustness": soft_d.mean().detach(),
-        "observed_hard_robustness": hard_d.mean(),
+        "observed_hard_robustness": hard_d.mean().detach(),
         "observed_gate_std": gate_std.detach(),
     }
+    soft_q_loss = F.softplus((soft_q - config.robust_q_target) / config.robust_softness).mul(config.robust_softness)
     loss = (
         config.lambda_robust * soft_mean
-        + config.lambda_robust_q * F.softplus((soft_q - config.robust_q_target) / config.robust_softness).mul(config.robust_softness)
+        + config.lambda_robust_q * soft_q_loss
         + config.lambda_robust_hard * hard_mean
         + config.lambda_robust_tail * hard_tail
         + config.lambda_branch_consistency * branch_cos
@@ -244,7 +235,6 @@ def v6_objective(
         + config.lambda_decorrelation * decor
         + config.lambda_gate_usage * gate_usage
         + config.lambda_gate_diversity * gate_diversity
-        + config.lambda_input_consistency * attacked_shift
     )
     return loss, terms
 
