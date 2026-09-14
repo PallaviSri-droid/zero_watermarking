@@ -7,12 +7,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from zero_watermarking.attacks import ATTACKS
 from zero_watermarking.baselines import method_registry
 from zero_watermarking.datasets import load_image, load_manifest, validate_manifest
 from zero_watermarking.deep_baselines import build_deep_registry
 from zero_watermarking.metrics import bit_balance, bit_entropy, evaluate_hash_bank, mean_abs_corr
 from zero_watermarking.protocol import DEFAULT_ATTACK_GRID, attack_grid, seed_everything
+from zero_watermarking.research_contract import attack_grid_fingerprint, manifest_fingerprint
 
 
 def _numeric_summary(result: dict) -> dict[str, float | int]:
@@ -53,7 +53,7 @@ def main() -> int:
     ap.add_argument("--size", type=int, default=128)
     ap.add_argument("--bits", type=int, default=256)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--deep", action="store_true", help="Also run optional pretrained deep baselines.")
+    ap.add_argument("--deep", action="store_true", help="Also run optional pretrained deep feature baselines.")
     args = ap.parse_args()
 
     if args.limit < 2:
@@ -74,6 +74,8 @@ def main() -> int:
         registry.update({k: v for k, v in build_deep_registry(args.bits).items() if v is not None})
 
     specs_json = json.dumps([spec.__dict__ for spec in DEFAULT_ATTACK_GRID], sort_keys=True)
+    attack_id = attack_grid_fingerprint(DEFAULT_ATTACK_GRID)
+    manifest_id = manifest_fingerprint(args.manifest)
     rows: list[dict[str, object]] = []
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -93,11 +95,14 @@ def main() -> int:
         bits_matrix = np.stack([clean_bank[key] for key in sorted(clean_bank)])
         summary = {
             "method": name,
+            "version": "common-benchmark",
             "seed": args.seed,
             "split": args.split,
             "images": len(clean_bank),
             "bits": args.bits,
             "image_size": args.size,
+            "manifest_id": manifest_id,
+            "attack_grid_id": attack_id,
             "attack_grid": specs_json,
             "balance_error": float(bit_balance(bits_matrix)),
             "bit_entropy": float(bit_entropy(bits_matrix)[0]),
@@ -114,6 +119,7 @@ def main() -> int:
     summary.to_csv(out / "journal_benchmark_summary.csv", index=False)
     print(summary.to_string(index=False))
     print(f"\nResults written to {out.resolve()}")
+    print(f"manifest_id={manifest_id} attack_grid_id={attack_id}")
     return 0
 
 
