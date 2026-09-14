@@ -24,14 +24,20 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .training import CAPZWHashNet, PairAttackDataset, TrainConfig, _update_memory, mgda_weights, objective_terms
+from .training import CAPZWHashNet, PairAttackDataset, _update_memory, objective_terms, mgda_weights
+from .v11 import V11Config, _selective_robustness_guard
 
 CAP_ZW_V12_VERSION = "CAP-ZW-v12"
 
 
 @dataclass
-class V12Config(TrainConfig):
-    """Collision-first CAP-ZW candidate with explicit anti-collapse controls."""
+class V12Config(V11Config):
+    """Collision-first CAP-ZW candidate with explicit anti-collapse controls.
+
+    Inherit V11Config so the controlled ablation switches (enable_mgda,
+    enable_memory_bank, enable_hard_negative_mining, enable_selective_guard)
+    remain available and compatible with the existing experiment runner.
+    """
 
     # Rebalance away from the overly restrictive v11 robustness guard.
     lambda_robust: float = 1.00
@@ -196,14 +202,16 @@ def train_cap_zw_v12(
             labels = labels.to(device, non_blocking=True)
             clean = model(clean_x, hard=False)
             attacked = model(attacked_x, hard=False)
-            memory_for_loss = memory_codes if memory_codes.numel() else None
-            labels_for_memory = memory_labels if memory_labels.numel() else None
+            use_memory = config.enable_memory_bank
+            memory_for_loss = memory_codes if (use_memory and memory_codes.numel()) else None
+            labels_for_memory = memory_labels if (use_memory and memory_labels.numel()) else None
             pair_count = int(clean.shape[0] * 2)
-            effective_topk = min(
-                max(config.topk_negatives, 1),
-                max(pair_count + int(memory_codes.shape[0]), 1),
-            )
-            progress = min(1.0, memory_codes.shape[0] / max(config.memory_warmup, 1))
+            memory_count = int(memory_codes.shape[0]) if use_memory else 0
+            if config.enable_hard_negative_mining:
+                effective_topk = min(max(config.topk_negatives, 1), max(pair_count + memory_count, 1))
+            else:
+                effective_topk = max(pair_count + memory_count, 1)
+            progress = min(1.0, memory_codes.shape[0] / max(config.memory_warmup, 1)) if use_memory else 0.0
             schedule = min(1.0, (epoch + 1) / max(config.epochs * 0.60, 1.0))
             active_margin = 0.18 + (float(config.margin) - 0.18) * schedule
             active_tail = 0.14 + (float(config.tail_target) - 0.14) * schedule
@@ -219,9 +227,7 @@ def train_cap_zw_v12(
                 config.robust_target, config.robust_softness,
                 active_binary,
             )
-            extra = _extra_terms(
-                clean, attacked, labels, memory_for_loss, labels_for_memory, config
-            )
+            extra = _extra_terms(clean, attacked, labels, memory_for_loss, labels_for_memory, config)
             terms = {**base, **extra}
             tasks = [terms[name] for name in task_names]
             if config.enable_mgda:
@@ -232,7 +238,6 @@ def train_cap_zw_v12(
             effective = effective / effective.sum().clamp_min(1e-12)
             base_loss = sum(weight * task for weight, task in zip(effective, tasks))
 
-            from .v11 import _selective_robustness_guard
             guard, violation, guard_q, worst_values = _selective_robustness_guard(
                 clean, attacked,
                 config.robustness_guard_target,
@@ -242,11 +247,14 @@ def train_cap_zw_v12(
                 config.robustness_guard_mean_weight,
                 config.robustness_guard_batch_fraction,
             )
+            if not config.enable_selective_guard:
+                guard = guard.detach() * 0.0
+                violation = violation.detach() * 0.0
             guard_warmup = min(1.0, (epoch + 1) / max(config.epochs * 0.50, 1.0))
             observed = float(violation)
             normalized = observed / max(config.robustness_guard_target, 1e-6)
             adaptive = 1.0 + min(1.0, max(0.0, normalized))
-            guard_weight = guard_multiplier * (0.30 + 0.30 * guard_warmup) * adaptive
+            guard_weight = guard_multiplier * (0.30 + 0.30 * guard_warmup) * adaptive if config.enable_selective_guard else 0.0
             loss = base_loss + guard_weight * guard
 
             optimizer.zero_grad(set_to_none=True)
@@ -254,16 +262,20 @@ def train_cap_zw_v12(
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
 
-            memory_codes, memory_labels = _update_memory(
-                memory_codes, memory_labels, clean, labels, config.memory_size
-            )
-            if observed > 0:
-                guard_multiplier = min(
-                    config.robustness_guard_lambda_max,
-                    guard_multiplier + config.robustness_guard_lambda_growth * min(1.0, normalized),
+            if use_memory:
+                memory_codes, memory_labels = _update_memory(
+                    memory_codes, memory_labels, clean, labels, config.memory_size
                 )
+            if config.enable_selective_guard:
+                if observed > 0:
+                    guard_multiplier = min(
+                        config.robustness_guard_lambda_max,
+                        guard_multiplier + config.robustness_guard_lambda_growth * min(1.0, normalized),
+                    )
+                else:
+                    guard_multiplier = max(config.robustness_guard_lambda_init, guard_multiplier * 0.995)
             else:
-                guard_multiplier = max(config.robustness_guard_lambda_init, guard_multiplier * 0.995)
+                guard_multiplier = 0.0
 
             for name in task_names:
                 totals[name] += float(terms[name].detach())
