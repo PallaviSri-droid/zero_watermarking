@@ -27,6 +27,10 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     ap.add_argument("--output", default="experiments/results/logpolar_dino_mrelbp")
+    ap.add_argument("--method-name", default="LogPolar+DINOv2+MRELBP")
+    ap.add_argument("--dino-weight", type=float, default=1.0)
+    ap.add_argument("--logpolar-weight", type=float, default=1.0)
+    ap.add_argument("--mrelbp-weight", type=float, default=1.0)
     args = ap.parse_args()
 
     seed_everything(args.seed)
@@ -42,7 +46,14 @@ def main() -> int:
     fit_images = np.stack([load_image(row.path, args.size) for row in fit_frame.itertuples(index=False)])
     test_images = np.stack([load_image(row.path, args.size) for row in test_frame.itertuples(index=False)])
 
-    config = HybridConfig(bits=args.bits, device=args.device, seed=args.seed)
+    config = HybridConfig(
+        bits=args.bits,
+        device=args.device,
+        seed=args.seed,
+        dino_weight=args.dino_weight,
+        logpolar_weight=args.logpolar_weight,
+        mrelbp_weight=args.mrelbp_weight,
+    )
     t0 = time.perf_counter()
     method = LogPolarDinoMRELBP(config)
     method.fit(fit_images)
@@ -66,7 +77,7 @@ def main() -> int:
     metrics = evaluate_hash_bank(clean_bank, attacked_bank)
     collision = metrics.pop("collision_statistics")
     out = {
-        "method": "LogPolar+DINOv2+MRELBP",
+        "method": args.method_name,
         "seed": args.seed,
         "fit_split": args.fit_split,
         "split": args.split,
@@ -78,6 +89,9 @@ def main() -> int:
         "evaluation_seconds": eval_seconds,
         "manifest_id": manifest_fingerprint(args.manifest),
         "attack_grid_id": attack_grid_fingerprint(DEFAULT_ATTACK_GRID),
+        "dino_weight": args.dino_weight,
+        "logpolar_weight": args.logpolar_weight,
+        "mrelbp_weight": args.mrelbp_weight,
         **{k: float(v) for k, v in metrics.items() if isinstance(v, (float, int, np.floating, np.integer))},
         **collision,
         "attack_grid": json.dumps([spec.__dict__ for spec in DEFAULT_ATTACK_GRID], sort_keys=True, default=str),
@@ -93,6 +107,7 @@ def main() -> int:
         json.dumps(
             {
                 "method": config.__dict__,
+                "method_name": args.method_name,
                 "attack_grid": [spec.__dict__ for spec in DEFAULT_ATTACK_GRID],
                 "manifest": args.manifest,
                 "manifest_id": manifest_fingerprint(args.manifest),
