@@ -1,0 +1,59 @@
+# Pre-registered CAP-ZW ablations. Change one mechanism at a time.
+# Selection must use train/validation data; test remains locked.
+experiments:
+  - name: full_cap_zw
+    enable_selective_guard: true
+    enable_hard_negative_mining: true
+    enable_memory_bank: true
+    enable_mgda: true
+    lambda_binary_collision: 1.32
+
+  - name: no_selective_guard
+    enable_selective_guard: false
+    enable_hard_negative_mining: true
+    enable_memory_bank: true
+    enable_mgda: true
+    lambda_binary_collision: 1.32
+
+  - name: no_binary_collision
+    enable_selective_guard: true
+    enable_hard_negative_mining: true
+    enable_memory_bank: true
+    enable_mgda: true
+    lambda_binary_collision: 0.0
+
+  - name: no_hard_negative_mining
+    enable_selective_guard: true
+    enable_hard_negative_mining: false
+    enable_memory_bank: true
+    enable_mgda: true
+    lambda_binary_collision: 1.32
+
+  - name: no_memory_bank
+    enable_selective_guard: true
+    enable_hard_negative_mining: true
+    enable_memory_bank: false
+    enable_mgda: true
+    lambda_binary_collision: 1.32
+
+  - name: fixed_weighted_sum
+    enable_selective_guard: true
+    enable_hard_negative_mining: true
+    enable_memory_bank: true
+    enable_mgda: false
+    lambda_binary_collision: 1.32
+
+  - name: robustness_only_reference
+    enable_selective_guard: false
+    enable_hard_negative_mining: false
+    enable_memory_bank: false
+    enable_mgda: false
+    lambda_tail: 0.0
+    lambda_diversity: 0.0
+    lambda_balance: 0.0
+    lambda_corr: 0.0
+    lambda_entropy: 0.0
+    lambda_uniformity: 0.0
+    lambda_consistency: 1.0
+    lambda_binary_collision: 0.0
+    lambda_robust: 1.0
