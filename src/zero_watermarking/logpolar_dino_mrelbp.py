@@ -12,12 +12,11 @@ copying code from any paper.  It combines three established descriptor families:
    histograms for noise/texture robustness.
 
 The fused descriptor is converted to a fixed-length binary signature using a
-fitted PCA + sign projection.  PCA is fitted only on the training/validation
-reference images supplied to ``fit`` and must never be fitted on the locked test
-set.
+training-only standardized PCA-like SVD projection + sign projection. The locked
+test set is never used to fit these transforms.
 
 Research note: DINOv2, Log-Polar descriptors and MRELBP are established building
-blocks.  This file is a benchmark implementation of their fusion, not a claim
+blocks. This file is a benchmark implementation of their fusion, not a claim
 that the fusion itself is previously published or novel.
 """
 
@@ -28,8 +27,6 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 
 
 @dataclass
@@ -75,7 +72,6 @@ def logpolar_fourier_feature(image: np.ndarray, size: int = 128) -> np.ndarray:
     )
     fft = np.fft.fft2(warped)
     mag = np.log1p(np.abs(fft)).astype(np.float32)
-    # Remove DC dominance and retain a compact fixed-size representation.
     mag[0, 0] = 0.0
     small = cv2.resize(mag, (32, 32), interpolation=cv2.INTER_AREA)
     vec = small.reshape(-1)
@@ -145,13 +141,58 @@ def mrelbp_feature(
             code |= ((local_median >= center_value[0]).astype(np.uint16) << i)
         parts.append(_lbp_hist(code, 2**points))
 
-    # Add a low-cost center/neighbor median relation histogram at each scale.
     for radius in tuple(radii):
         center = _median_map(x, radius)
         ring = cv2.blur(x, (2 * radius + 1, 2 * radius + 1))
         signed = (ring >= center).astype(np.uint8)
         parts.append(_lbp_hist(signed, 2))
     return np.concatenate(parts).astype(np.float32)
+
+
+class _Standardizer:
+    """Small NumPy-only equivalent of feature standardization."""
+
+    def __init__(self) -> None:
+        self.mean_: np.ndarray | None = None
+        self.scale_: np.ndarray | None = None
+
+    def fit(self, x: np.ndarray) -> "_Standardizer":
+        x = np.asarray(x, dtype=np.float32)
+        self.mean_ = x.mean(axis=0)
+        scale = x.std(axis=0)
+        self.scale_ = np.where(scale > 1e-8, scale, 1.0).astype(np.float32)
+        return self
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        if self.mean_ is None or self.scale_ is None:
+            raise RuntimeError("fit() must be called before transform()")
+        return (np.asarray(x, dtype=np.float32) - self.mean_) / self.scale_
+
+
+class _SVDPCA:
+    """Deterministic PCA projection using NumPy's SVD."""
+
+    def __init__(self, n_components: int) -> None:
+        self.n_components = int(n_components)
+        self.mean_: np.ndarray | None = None
+        self.components_: np.ndarray | None = None
+
+    def fit(self, x: np.ndarray) -> "_SVDPCA":
+        x = np.asarray(x, dtype=np.float32)
+        if x.ndim != 2 or x.shape[0] < 1:
+            raise ValueError("PCA input must be a non-empty 2-D array")
+        self.mean_ = x.mean(axis=0)
+        centered = x - self.mean_
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        rank = min(self.n_components, vh.shape[0])
+        self.components_ = vh[:rank].astype(np.float32)
+        return self
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        if self.mean_ is None or self.components_ is None:
+            raise RuntimeError("fit() must be called before transform()")
+        centered = np.asarray(x, dtype=np.float32) - self.mean_
+        return centered @ self.components_.T
 
 
 class LogPolarDinoMRELBP:
@@ -161,13 +202,12 @@ class LogPolarDinoMRELBP:
         self.config = config or HybridConfig()
         self.device = _device(self.config.device)
         self.dino = None
-        self.scaler: StandardScaler | None = None
-        self.pca: PCA | None = None
+        self.scaler: _Standardizer | None = None
+        self.pca: _SVDPCA | None = None
         self.projection: np.ndarray | None = None
         self._load_dino()
 
     def _load_dino(self) -> None:
-        # Official Meta DINOv2 weights are loaded through PyTorch Hub.
         self.dino = torch.hub.load("facebookresearch/dinov2", self.config.dino_model)
         self.dino.eval().to(self.device)
         for parameter in self.dino.parameters():
@@ -175,10 +215,14 @@ class LogPolarDinoMRELBP:
 
     @torch.no_grad()
     def _dino_features(self, images: np.ndarray) -> np.ndarray:
-        # Input images are grayscale [N,H,W] in [0,1]. DINO expects 3 channels.
         x = torch.from_numpy(images.astype(np.float32))[:, None, :, :]
         x = x.repeat(1, 3, 1, 1)
-        x = F.interpolate(x, size=(self.config.image_size, self.config.image_size), mode="bicubic", align_corners=False)
+        x = F.interpolate(
+            x,
+            size=(self.config.image_size, self.config.image_size),
+            mode="bicubic",
+            align_corners=False,
+        )
         mean = torch.tensor((0.485, 0.456, 0.406), device=self.device)[None, :, None, None]
         std = torch.tensor((0.229, 0.224, 0.225), device=self.device)[None, :, None, None]
         x = (x.to(self.device) - mean) / std
@@ -208,10 +252,10 @@ class LogPolarDinoMRELBP:
 
     def fit(self, images: np.ndarray) -> "LogPolarDinoMRELBP":
         raw = self._raw_features(images)
-        self.scaler = StandardScaler().fit(raw)
+        self.scaler = _Standardizer().fit(raw)
         scaled = self.scaler.transform(raw)
         n_components = min(self.config.pca_components, scaled.shape[0], scaled.shape[1])
-        self.pca = PCA(n_components=n_components, random_state=self.config.seed).fit(scaled)
+        self.pca = _SVDPCA(n_components=n_components).fit(scaled)
         projected = self.pca.transform(scaled)
         rng = np.random.default_rng(self.config.seed)
         self.projection = rng.normal(size=(projected.shape[1], self.config.bits)).astype(np.float32)
