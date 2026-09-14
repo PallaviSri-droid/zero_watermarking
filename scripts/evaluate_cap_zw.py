@@ -14,7 +14,6 @@ from zero_watermarking.protocol import seed_everything
 from zero_watermarking.research_contract import attack_grid_fingerprint, manifest_fingerprint
 from zero_watermarking.training import CAP_ZW_VERSION, CAPZWHashNet
 
-
 DEFAULT_ATTACK_GRID = (
     ("gaussian_noise", {"sigma": 0.03, "seed": 11}),
     ("gaussian_noise", {"sigma": 0.08, "seed": 17}),
@@ -30,13 +29,20 @@ DEFAULT_ATTACK_GRID = (
 )
 
 
-def load_model(checkpoint: Path, bits: int, device: str) -> tuple[CAPZWHashNet, dict]:
-    model = CAPZWHashNet(nbits=bits)
+def load_model(checkpoint: Path, bits: int, device: str) -> tuple[torch.nn.Module, dict]:
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
+    if not isinstance(payload, dict):
+        payload = {"model": payload}
+    model_type = str(payload.get("model_type", "CAPZWHashNet"))
+    if model_type == "RelationalHashNetV15" or str(payload.get("version", "")).startswith("CAP-ZW-v15"):
+        from zero_watermarking.v15 import RelationalHashNetV15
+        model: torch.nn.Module = RelationalHashNetV15(nbits=bits)
+    else:
+        model = CAPZWHashNet(nbits=bits)
     state = payload.get("model", payload)
     model.load_state_dict(state)
     model.to(device).eval()
-    return model, payload if isinstance(payload, dict) else {}
+    return model, payload
 
 
 def main() -> int:
@@ -56,6 +62,7 @@ def main() -> int:
     if device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but is not available.")
 
+    seed_everything(42)
     frame = validate_manifest(load_manifest(args.manifest))
     frame = frame[frame["exists"]].reset_index(drop=True)
     if "split" in frame.columns:
