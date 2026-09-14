@@ -14,6 +14,7 @@ from zero_watermarking.cap_dino_logpolar_stable import (
     stable_objective,
 )
 from zero_watermarking.datasets import load_image, load_manifest, validate_manifest
+from zero_watermarking.hash_tail_memory import memory_hard_negative_loss
 from zero_watermarking.protocol import seed_everything
 from zero_watermarking.training import PairAttackDataset, _update_memory
 
@@ -41,7 +42,7 @@ def _load_warm_start(model: torch.nn.Module, checkpoint: Path) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Train stable CAP-DINO-LogPolar with v6 warm start.")
+    ap = argparse.ArgumentParser(description="Train stable CAP-DINO-LogPolar with v6 warm start and optional memory-backed hard-negative supervision.")
     ap.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
     ap.add_argument("--split", default="train_val")
     ap.add_argument("--limit", type=int, default=5000)
@@ -57,6 +58,11 @@ def main() -> int:
     ap.add_argument("--init-checkpoint", default="experiments/checkpoints/cap_dino_logpolar_v6_seed42.pt")
     ap.add_argument("--checkpoint", default="experiments/checkpoints/cap_dino_logpolar_stable_seed42.pt")
     ap.add_argument("--history", default="experiments/results/cap_dino_logpolar_stable_seed42_training_history.csv")
+    ap.add_argument("--lambda-memory-hard-negative", type=float, default=0.20)
+    ap.add_argument("--memory-margin", type=float, default=0.32)
+    ap.add_argument("--memory-temperature", type=float, default=0.08)
+    ap.add_argument("--memory-topk", type=int, default=24)
+    ap.add_argument("--memory-warmup", type=int, default=64)
     args = ap.parse_args()
 
     seed_everything(args.seed)
@@ -80,6 +86,11 @@ def main() -> int:
     cfg = StableConfig(bits=args.bits, device=device, attack_views=args.attack_views)
     cfg.epochs = args.epochs
     cfg.lr = args.lr
+    cfg.memory_hard_negative_weight = args.lambda_memory_hard_negative
+    cfg.memory_hard_negative_margin = args.memory_margin
+    cfg.memory_hard_negative_temperature = args.memory_temperature
+    cfg.memory_hard_negative_topk = args.memory_topk
+    cfg.memory_hard_negative_warmup = args.memory_warmup
     model = CAPDinoLogPolarStable(cfg)
     init_path = Path(args.init_checkpoint)
     if init_path.exists():
@@ -106,6 +117,22 @@ def main() -> int:
             mem = memory_codes if memory_codes.numel() else None
             mem_labels = memory_labels if memory_labels.numel() else None
             loss, terms = stable_objective(pair, labels_t, mem, mem_labels, cfg, stage=stage)
+
+            memory_term = memory_hard_negative_loss(
+                torch.cat([pair["clean_soft"], pair["attacked_soft"],], dim=0),
+                torch.cat([labels_t, labels_t], dim=0),
+                mem,
+                mem_labels,
+                margin=args.memory_margin,
+                temperature=args.memory_temperature,
+                topk=args.memory_topk,
+            )
+            memory_active = stage >= 2 and memory_codes.shape[0] >= args.memory_warmup
+            memory_weight = args.lambda_memory_hard_negative if memory_active else 0.0
+            loss = loss + memory_weight * memory_term
+            terms["memory_hard_negative"] = memory_term
+            terms["memory_hard_negative_weight"] = loss.new_tensor(memory_weight)
+
             if not torch.isfinite(loss) or not all(torch.isfinite(v).all().item() for v in terms.values()):
                 optimizer.zero_grad(set_to_none=True)
                 skipped += 1
@@ -148,7 +175,7 @@ def main() -> int:
         out = Path(args.checkpoint); out.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"version": STABLE_VERSION, "model": model.state_dict(), "config": cfg.__dict__, "optimizer": optimizer.state_dict(), "epoch": epoch + 1, "history": history, "init_checkpoint": str(init_path)}, out)
         hp = Path(args.history); hp.parent.mkdir(parents=True, exist_ok=True); pd.DataFrame(history).to_csv(hp, index=False)
-        print(f"epoch={epoch+1} stage={stage} loss={row.get('loss', 0):.5f} robust={row.get('robustness', 0):.5f} robust_q={row.get('robustness_q', 0):.5f} contrastive={row.get('contrastive', 0):.5f} entropy={row.get('observed_entropy', 0):.4f} gates={row.get('gate_0', 0):.3f}/{row.get('gate_1', 0):.3f}/{row.get('gate_2', 0):.3f} skipped={skipped}")
+        print(f"epoch={epoch+1} stage={stage} loss={row.get('loss', 0):.5f} robust={row.get('robustness', 0):.5f} robust_q={row.get('robustness_q', 0):.5f} contrastive={row.get('contrastive', 0):.5f} memory={row.get('memory_hard_negative', 0):.5f} memory_w={row.get('memory_hard_negative_weight', 0):.3f} entropy={row.get('observed_entropy', 0):.4f} gates={row.get('gate_0', 0):.3f}/{row.get('gate_1', 0):.3f}/{row.get('gate_2', 0):.3f} skipped={skipped}")
 
     print(f"Training complete: {STABLE_VERSION} seed={args.seed} images={len(images)} effective_samples={len(dataset)} bits={args.bits} epochs={args.epochs} device={device}")
     print(f"checkpoint={Path(args.checkpoint).resolve()}")
