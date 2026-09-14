@@ -1,0 +1,1 @@
+The candidate adds low-weight multi-scale local patch-relation statistics from frozen DINO patch tokens to the stable fused representation. It is motivated by Rel-Zero CVPR 2026 and by CXR literature emphasizing local/global complementary representations. Promotion is conditional on improved collision-tail metrics without unacceptable robustness regression.

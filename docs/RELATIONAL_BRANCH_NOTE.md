@@ -1,0 +1,1 @@
+Relational extension files are experimental and should be evaluated against the frozen CAP-DINO-LogPolar-stable-repair checkpoint before promotion. The stable checkpoint and 200-image baseline remain the reference.
