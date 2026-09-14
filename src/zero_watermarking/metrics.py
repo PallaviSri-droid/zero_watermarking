@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-from sklearn.metrics import roc_auc_score, roc_curve
 
 
 def hamming(a: np.ndarray, b: np.ndarray) -> float:
@@ -54,19 +53,75 @@ def mean_abs_corr(bits: np.ndarray) -> float:
     return float(vals.mean()) if len(vals) else 0.0
 
 
+def _binary_auc(labels: np.ndarray, scores: np.ndarray) -> float:
+    """AUC from pairwise ranking, avoiding sklearn's compiled extensions."""
+    labels = np.asarray(labels, dtype=np.int8).ravel()
+    scores = np.asarray(scores, dtype=np.float64).ravel()
+    positives = scores[labels == 1]
+    negatives = scores[labels == 0]
+    if positives.size == 0 or negatives.size == 0:
+        raise ValueError("AUC requires both positive and negative samples")
+
+    # Mann-Whitney formulation: ties contribute 0.5.
+    order = np.argsort(scores, kind="mergesort")
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    ranks = np.empty_like(scores, dtype=np.float64)
+    i = 0
+    n = len(scores)
+    while i < n:
+        j = i + 1
+        while j < n and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        rank = 0.5 * (i + 1 + j)
+        ranks[order[i:j]] = rank
+        i = j
+    pos_count = float(positives.size)
+    neg_count = float(negatives.size)
+    rank_sum = float(ranks[labels == 1].sum())
+    return (rank_sum - pos_count * (pos_count + 1.0) / 2.0) / (pos_count * neg_count)
+
+
+def _roc_curve_native(labels: np.ndarray, scores: np.ndarray):
+    """Compute ROC points with stable tie handling, descending score order."""
+    labels = np.asarray(labels, dtype=np.int8).ravel()
+    scores = np.asarray(scores, dtype=np.float64).ravel()
+    if labels.shape != scores.shape:
+        raise ValueError("labels and scores must have identical shape")
+
+    order = np.argsort(-scores, kind="mergesort")
+    labels_sorted = labels[order]
+    scores_sorted = scores[order]
+    positives = float(np.count_nonzero(labels == 1))
+    negatives = float(np.count_nonzero(labels == 0))
+    if positives == 0 or negatives == 0:
+        raise ValueError("ROC requires both positive and negative samples")
+
+    distinct = np.r_[True, scores_sorted[1:] != scores_sorted[:-1]]
+    threshold_idx = np.flatnonzero(distinct)
+    tps = np.cumsum(labels_sorted == 1, dtype=np.float64)[threshold_idx]
+    fps = np.cumsum(labels_sorted == 0, dtype=np.float64)[threshold_idx]
+    thresholds = scores_sorted[threshold_idx]
+
+    tpr = np.r_[0.0, tps / positives, 1.0]
+    fpr = np.r_[0.0, fps / negatives, 1.0]
+    thresholds = np.r_[np.inf, thresholds, -np.inf]
+    return fpr, tpr, thresholds
+
+
 def roc_stats(genuine_scores, impostor_scores):
     """Compute ROC metrics where larger scores mean 'same image'."""
     genuine_scores = np.asarray(genuine_scores, dtype=float)
     impostor_scores = np.asarray(impostor_scores, dtype=float)
     if genuine_scores.size == 0 or impostor_scores.size == 0:
         raise ValueError("ROC requires both genuine and impostor scores")
-    y = np.r_[np.ones(len(genuine_scores)), np.zeros(len(impostor_scores))]
+    y = np.r_[np.ones(len(genuine_scores), dtype=np.int8), np.zeros(len(impostor_scores), dtype=np.int8)]
     scores = np.r_[genuine_scores, impostor_scores]
-    auc = float(roc_auc_score(y, scores))
-    fpr, tpr, thresholds = roc_curve(y, scores)
-    fnr = 1 - tpr
+    auc = float(_binary_auc(y, scores))
+    fpr, tpr, thresholds = _roc_curve_native(y, scores)
+    fnr = 1.0 - tpr
     i = int(np.nanargmin(np.abs(fpr - fnr)))
-    eer = float((fpr[i] + fnr[i]) / 2)
+    eer = float((fpr[i] + fnr[i]) / 2.0)
     return {"auc": auc, "eer": eer, "fpr": fpr, "tpr": tpr, "fnr": fnr, "thresholds": thresholds}
 
 
