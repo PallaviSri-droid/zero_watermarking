@@ -1,0 +1,4 @@
+Baseline checkpoint: experiments/checkpoints/cap_dino_logpolar_stable_seed42.pt
+Development evaluation: 200 images from test split only for diagnostics
+No changes to data/manifests/medical_manifest.csv
+Candidate: CAP-DINO-LogPolar-relational

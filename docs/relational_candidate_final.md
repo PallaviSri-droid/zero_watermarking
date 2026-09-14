@@ -1,0 +1,1 @@
+Candidate scope: preserve stable repair; add conservative DINO patch-relation residual; train from frozen stable checkpoint; evaluate on 200-image development protocol first; reject on robustness regression without collision-tail gain.
