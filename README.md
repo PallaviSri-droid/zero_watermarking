@@ -121,6 +121,8 @@ python scripts/run_hybrid_component_ablation.py \
   --device auto
 ```
 
+The reproduction provenance and limitations are recorded in `reports/competitor_reproduction.md`.
+
 ## CAP-ZW ablations
 
 The pre-registered CAP-ZW suite varies one mechanism at a time around the locked candidate:
@@ -162,8 +164,6 @@ python scripts/evaluate_cap_zw_ablation_suite.py \
   --device auto
 ```
 
-The final five-seed experiment is run only for shortlisted configurations.
-
 ## Reproducible experiment sequence
 
 ### 1. Environment
@@ -197,7 +197,7 @@ python scripts/train_cap_zw_final.py \
   --device auto
 ```
 
-### 4. Run the common classical/deep benchmark
+### 4. Common classical/deep benchmark
 
 ```bash
 python scripts/run_full_benchmark.py \
@@ -205,7 +205,8 @@ python scripts/run_full_benchmark.py \
   --split test \
   --limit 200 \
   --size 128 \
-  --bits 256
+  --bits 256 \
+  --seed 42
 ```
 
 ### 5. Compare retained summaries
@@ -213,7 +214,7 @@ python scripts/run_full_benchmark.py \
 ```bash
 python scripts/compare_cap_zw_vs_hybrid.py \
   --input "LogPolar+DINOv2+MRELBP=experiments/results/logpolar_dino_mrelbp/summary_seed_42.csv" \
-  "CAP-ZW=experiments/results/cap_zw_test/summary.csv"
+  --input "CAP-ZW=experiments/results/cap_zw_test/summary.csv"
 ```
 
 The comparison tool verifies immutable protocol identity before reporting metric winners.
@@ -251,6 +252,8 @@ python scripts/aggregate_multi_seed.py \
 Selection uses training/validation data. The test split is evaluated only after the candidate is locked. The primary scientific evidence is collision-tail risk and exact/near collision rate, followed by robustness and verification discrimination. Hash quality and computational cost are secondary criteria.
 
 If another method wins, report it. The benchmark is designed to determine whether the CAP-ZW hypothesis is supported, not to guarantee a win.
+
+See `reports/publication_execution_plan.md` for the full experimental gates.
 
 ## Reproducibility
 
