@@ -42,17 +42,16 @@ def _read(path: Path, label: str) -> pd.DataFrame:
     return frame
 
 
-def _row_dict(row: pd.Series) -> dict:
-    return row.to_dict()
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="Compare methods under the locked publication benchmark contract.")
-    ap.add_argument("--input", nargs="+", metavar="LABEL=SUMMARY.csv", help="Two or more labeled summary files")
+    ap.add_argument(
+        "--input", nargs="+", action="append", metavar="LABEL=SUMMARY.csv",
+        required=True, help="One or more labeled summary files; repeat --input for additional groups.",
+    )
     ap.add_argument("--output", default="experiments/results/common_comparison/comparison.csv")
     args = ap.parse_args()
 
-    specs = list(args.input or [])
+    specs = [item for group in args.input for item in group]
     if len(specs) < 2:
         raise SystemExit("Provide at least two inputs via --input LABEL=SUMMARY.csv")
 
@@ -63,9 +62,9 @@ def main() -> int:
         label, path = spec.split("=", 1)
         frames.append(_read(Path(path), label))
 
-    reference = _row_dict(frames[0].iloc[0])
+    reference = frames[0].iloc[0].to_dict()
     for frame in frames[1:]:
-        assert_compatible_summaries(reference, _row_dict(frame.iloc[0]))
+        assert_compatible_summaries(reference, frame.iloc[0].to_dict())
 
     combined = pd.concat(frames, ignore_index=True)
     winner_rows = []
@@ -87,12 +86,12 @@ def main() -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(output, index=False)
-    pd.DataFrame(winner_rows).to_csv(output.with_name("metric_winners.csv"), index=False)
+    winners = pd.DataFrame(winner_rows)
+    winners.to_csv(output.with_name("metric_winners.csv"), index=False)
 
     display_cols = ["method"] + [m for m in METRICS if m in combined.columns]
     print(combined[display_cols].to_string(index=False))
     print("\nMetric winners:")
-    winners = pd.DataFrame(winner_rows)
     print(winners.to_string(index=False) if not winners.empty else "No comparable metrics found.")
     print(f"\nComparison written to {output.resolve()}")
     return 0
