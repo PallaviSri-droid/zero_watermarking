@@ -9,6 +9,14 @@ from pathlib import Path
 import yaml
 
 
+BOOL_FLAGS = {
+    "enable_selective_guard": "--no-selective-guard",
+    "enable_hard_negative_mining": "--no-hard-negative-mining",
+    "enable_memory_bank": "--no-memory-bank",
+    "enable_mgda": "--no-mgda",
+}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run the pre-registered CAP-ZW ablation suite.")
     ap.add_argument("--config", default="configs/cap_zw_ablations.yaml")
@@ -57,15 +65,15 @@ def main() -> int:
         for key, value in item.items():
             if key == "name":
                 continue
+            if key in BOOL_FLAGS:
+                if value is False:
+                    command.append(BOOL_FLAGS[key])
+                continue
             flag = "--" + key.replace("_", "-")
-            if isinstance(value, bool):
-                command.append(flag if value else "--no-" + key.replace("_", "-"))
-            else:
-                command.extend([flag, str(value)])
+            command.extend([flag, str(value)])
 
         print("Running:", " ".join(command))
         subprocess.run(command, check=True)
-
         (outdir / "ablation_spec.json").write_text(json.dumps(item, indent=2), encoding="utf-8")
 
     print(f"Ablation outputs: {root.resolve()}")
