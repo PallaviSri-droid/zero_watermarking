@@ -7,14 +7,29 @@ import numpy as np
 import pandas as pd
 import torch
 
-from zero_watermarking.cap_dino_logpolar import CAPDinoLogPolar, FusionConfig, fusion_loss, fusion_objective, CAP_DINO_LP_VERSION
+from zero_watermarking.cap_dino_logpolar import (
+    CAPDinoLogPolar,
+    CAP_DINO_LP_VERSION,
+    FusionConfig,
+    fusion_loss,
+    fusion_objective,
+)
 from zero_watermarking.datasets import load_image, load_manifest, validate_manifest
 from zero_watermarking.protocol import seed_everything
 from zero_watermarking.training import PairAttackDataset
 
 ATTACKS = (
-    "gaussian_noise", "salt_pepper", "gaussian_blur", "median_blur", "jpeg",
-    "brightness", "contrast", "rotation", "crop_resize", "translation", "compound",
+    "gaussian_noise",
+    "salt_pepper",
+    "gaussian_blur",
+    "median_blur",
+    "jpeg",
+    "brightness",
+    "contrast",
+    "rotation",
+    "crop_resize",
+    "translation",
+    "compound",
 )
 
 
@@ -35,7 +50,11 @@ def main() -> int:
     args = ap.parse_args()
 
     seed_everything(args.seed)
-    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu" if args.device == "auto" else args.device
+    device = (
+        "cuda" if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto"
+        else args.device
+    )
     if device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA was requested but is not available.")
 
@@ -70,16 +89,36 @@ def main() -> int:
     history: list[dict[str, float]] = []
     for epoch in range(args.epochs):
         model.train()
-        totals = {k: 0.0 for k in ("loss", "robustness", "discrimination", "separation_tail", "entropy_loss", "balance", "decorrelation", "binary_collision", "gate_entropy", "gate_balance", "q05", "q10", "bit_entropy")}
+        totals = {
+            k: 0.0
+            for k in (
+                "loss",
+                "robustness",
+                "discrimination",
+                "separation_tail",
+                "entropy_loss",
+                "balance",
+                "decorrelation",
+                "binary_collision",
+                "gate_entropy",
+                "gate_balance",
+                "bit_entropy",
+            )
+        }
         gate_sum = np.zeros(3, dtype=np.float64)
         batches = 0
+
         for batch in loader:
             clean_x, attacked_x, labels_t = [x.to(device) for x in batch[:3]]
-            clean, clean_gates = model.forward_with_gate(clean_x, hard=False)
-            attacked, attacked_gates = model.forward_with_gate(attacked_x, hard=False)
+
+            # Use straight-through hard bits during training so the objective
+            # sees the same binary representation that the evaluator measures.
+            clean, clean_gates = model.forward_with_gate(clean_x, hard=True)
+            attacked, attacked_gates = model.forward_with_gate(attacked_x, hard=True)
             gates = torch.cat([clean_gates, attacked_gates], dim=0)
             terms = fusion_objective(clean, attacked, labels_t, gates)
             loss = fusion_loss(terms)
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -89,6 +128,11 @@ def main() -> int:
                 if key in terms:
                     totals[key] += float(terms[key].detach())
             totals["loss"] += float(loss.detach())
+            p = clean.detach().mean(dim=0)
+            bit_entropy = -(p.clamp(1e-5, 1 - 1e-5) * torch.log2(p.clamp(1e-5, 1 - 1e-5)) +
+                            (1 - p).clamp(1e-5, 1 - 1e-5) *
+                            torch.log2((1 - p).clamp(1e-5, 1 - 1e-5))).mean()
+            totals["bit_entropy"] += float(bit_entropy)
             gate_sum += gates.detach().mean(dim=0).cpu().numpy()
             batches += 1
 
@@ -99,14 +143,17 @@ def main() -> int:
 
         path = Path(args.checkpoint)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
-            "version": CAP_DINO_LP_VERSION,
-            "model": model.state_dict(),
-            "config": config.__dict__,
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch + 1,
-            "history": history,
-        }, path)
+        torch.save(
+            {
+                "version": CAP_DINO_LP_VERSION,
+                "model": model.state_dict(),
+                "config": config.__dict__,
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch + 1,
+                "history": history,
+            },
+            path,
+        )
 
     history_path = Path(args.history)
     history_path.parent.mkdir(parents=True, exist_ok=True)
