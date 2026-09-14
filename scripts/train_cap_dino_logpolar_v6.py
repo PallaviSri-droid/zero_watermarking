@@ -18,6 +18,17 @@ ATTACKS = (
 )
 
 
+def _finite_parameters(model: torch.nn.Module) -> bool:
+    return all(torch.isfinite(p).all().item() for p in model.parameters() if p.requires_grad)
+
+
+def _finite_gradients(model: torch.nn.Module) -> bool:
+    return all(
+        p.grad is None or torch.isfinite(p.grad).all().item()
+        for p in model.parameters() if p.requires_grad
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Train CAP-DINO-LogPolar v6 tail-robust fusion.")
     ap.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
@@ -28,7 +39,7 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--attack-views", type=int, default=11)
-    ap.add_argument("--lr", type=float, default=1.5e-4)
+    ap.add_argument("--lr", type=float, default=8e-5)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     ap.add_argument("--checkpoint", default="experiments/checkpoints/cap_dino_logpolar_v6_seed42.pt")
@@ -58,10 +69,16 @@ def main() -> int:
 
     cfg = V6Config(bits=args.bits, device=device, attack_views=args.attack_views)
     model = CAPDinoLogPolarV6(cfg)
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=2e-4)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=2e-4,
+        eps=1e-8,
+    )
     memory_codes = torch.empty((0, args.bits), dtype=torch.float32, device=device)
     memory_labels = torch.empty((0,), dtype=torch.long, device=device)
     history: list[dict[str, float]] = []
+    skipped_batches = 0
 
     for epoch in range(args.epochs):
         model.train()
@@ -81,16 +98,33 @@ def main() -> int:
             mem_labels = memory_labels if memory_labels.numel() else None
             loss, terms = v6_objective(pair, labels_t, mem, mem_labels, cfg)
 
+            if not torch.isfinite(loss) or not all(torch.isfinite(v).all().item() for v in terms.values()):
+                optimizer.zero_grad(set_to_none=True)
+                skipped_batches += 1
+                continue
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            if not _finite_gradients(model):
+                optimizer.zero_grad(set_to_none=True)
+                skipped_batches += 1
+                continue
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0, error_if_nonfinite=True)
+            if not _finite_gradients(model):
+                optimizer.zero_grad(set_to_none=True)
+                skipped_batches += 1
+                continue
             optimizer.step()
+            if not _finite_parameters(model):
+                raise RuntimeError("Non-finite model parameters after optimizer.step(); aborting to protect checkpoint integrity.")
 
-            memory_codes, memory_labels = _update_memory(memory_codes, memory_labels, pair["clean_hard"].detach(), labels_t, cfg.memory_size)
+            memory_codes, memory_labels = _update_memory(
+                memory_codes, memory_labels, pair["clean_hard"].detach(), labels_t, cfg.memory_size
+            )
 
             for k in totals:
                 if k in terms:
-                    totals[k] += float(loss.detach() if k == "loss" else terms[k].detach())
+                    totals[k] += float(terms[k].detach())
             totals["loss"] += float(loss.detach())
             g = pair["clean_gates"].detach()
             m = pair["branch_mask"].detach()
@@ -106,6 +140,7 @@ def main() -> int:
 
         d = max(batches, 1)
         row = {"epoch": float(epoch + 1), **{k: v / d for k, v in totals.items()}}
+        row["skipped_batches"] = float(skipped_batches)
         history.append(row)
         out = Path(args.checkpoint); out.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"version": CAP_DINO_LP_V6_VERSION, "model": model.state_dict(), "config": cfg.__dict__,
@@ -113,7 +148,7 @@ def main() -> int:
         hp = Path(args.history); hp.parent.mkdir(parents=True, exist_ok=True); pd.DataFrame(history).to_csv(hp, index=False)
         print(f"epoch={epoch+1} loss={row['loss']:.5f} soft_rob={row['robustness']:.5f} hard_rob={row['robustness_hard']:.5f} "
               f"entropy={row['observed_entropy']:.4f} gates={row['gate_0']:.3f}/{row['gate_1']:.3f}/{row['gate_2']:.3f} "
-              f"gate_std={row['observed_gate_std']:.4f}")
+              f"gate_std={row['observed_gate_std']:.4f} skipped={int(row['skipped_batches'])}")
 
     print(f"Training complete: {CAP_DINO_LP_V6_VERSION} seed={args.seed} images={len(images)} effective_samples={len(dataset)} bits={args.bits} epochs={args.epochs} device={device}")
     print(f"checkpoint={Path(args.checkpoint).resolve()}")
