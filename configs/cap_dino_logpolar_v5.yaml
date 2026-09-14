@@ -1,0 +1,63 @@
+version: CAP-DINO-LP-v5
+method: CAP-DINO-LogPolar-v5-SharedGate
+bits: 128
+image_size: 128
+attack_views: 6
+
+model:
+  cap_dim: 192
+  dino_dim: 384
+  fusion_dim: 192
+  dino_model: dinov2_vits14
+  dino_size: 224
+  logpolar_size: 128
+  cap_weight: 1.0
+  dino_weight: 1.0
+  logpolar_weight: 0.85
+  gate_temperature: 1.0
+  quantizer_temperature: 1.5
+  threshold_init_std: 0.08
+  dropout: 0.08
+  freeze_dino: true
+
+optimization:
+  epochs: 20
+  batch_size: 16
+  lr: 0.0002
+  weight_decay: 0.0002
+  grad_clip: 5.0
+  memory_size: 4096
+  topk_negatives: 24
+
+objectives:
+  robust_target: 0.055
+  robust_q_target: 0.075
+  robust_softness: 0.012
+  margin: 0.36
+  q05_target: 0.10
+  q10_target: 0.16
+  entropy_target: 0.82
+  balance_target: 0.12
+  binary_confidence_target: 0.16
+  binary_collision_target: 0.16
+  lambda_robust: 1.00
+  lambda_robust_q: 0.65
+  lambda_branch_consistency: 0.60
+  lambda_discrimination: 1.00
+  lambda_tail: 1.10
+  lambda_binary_collision: 1.15
+  lambda_entropy: 0.70
+  lambda_balance: 0.30
+  lambda_decorrelation: 0.25
+  lambda_gate_consistency: 0.30
+  lambda_gate_usage: 0.20
+  lambda_gate_sharpness: 0.04
+
+protocol:
+  manifest: data/manifests/medical_manifest.csv
+  train_split: train_val
+  evaluation_split: test
+  development_images: 200
+  publication_subset_images: 5000
+  hash_length: 128
+  attack_grid_locked: true
