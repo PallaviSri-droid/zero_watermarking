@@ -2,7 +2,7 @@
 
 A reproducible research codebase for **collision-aware medical-image zero-watermarking**, with explicit robustness, discriminability and collision-tail evaluation.
 
-> **Research status:** the repository contains a locked candidate, reference checkpoints and the full evaluation protocol, plus a reproducible LogPolar+DINOv2+MRELBP comparison baseline. Scientific superiority claims remain blocked until the common multi-seed benchmark is completed.
+> **Research status:** the repository contains a locked candidate, reference checkpoints, a reproducible LogPolar+DINOv2+MRELBP comparison baseline, strict benchmark identity checks, and pre-registered ablation runners. Scientific superiority claims remain blocked until the common multi-seed benchmark is completed.
 
 ## Research question
 
@@ -14,20 +14,9 @@ The working research label is **CAP-ZW (Collision-Aware Pareto Zero-Watermarking
 
 The intended contribution is the **collision-aware multi-objective formulation and evaluation protocol**. Components such as STE/BEMQ, balanced hashing, contrastive learning, CNN features, hard-negative mining and MGDA-style optimization are treated as established building blocks rather than individually novel contributions.
 
-## Repository structure
-
-```text
-src/zero_watermarking/      Core algorithms, attacks, metrics, training and protocol
-scripts/                    Reproducible training, evaluation and comparison runners
-configs/                    Locked experimental configurations
-notebooks/                  Analysis and publication-figure notebooks
-reports/                    Research protocol, literature matrix and publication checklist
-tests/                      Regression/unit tests
-```
-
 ## Benchmark contract
 
-Every main-table comparison must use the same patient/group split, image preprocessing, hash length, attack grid, negative-pair evaluation design, metric implementation and decision rule.
+Every main-table comparison must use the same patient/group split, image preprocessing, hash length, attack grid, negative-pair evaluation design, metric implementation and decision rule. Each new summary records a manifest fingerprint and attack-grid fingerprint; the comparison tool rejects incompatible summaries instead of silently mixing protocols.
 
 ### Robustness
 
@@ -65,11 +54,11 @@ Report inter q01/q05/q10, intra q90/q95, q05/q10 tail gaps, balance error, mean 
 - **CAP-ZW-v11:** selective robustness refinement.
 - **CAP-ZW-final-candidate:** locked candidate combining collision-focused v9 mechanisms with the selective robustness guard from v11. It must still be selected/validated through controlled multi-seed experiments.
 
-The repository deliberately avoids uncontrolled hand-tuned version chasing. See `reports/cap_zw_final_research_spec.md` and `reports/journal_protocol.md`.
+The repository deliberately avoids uncontrolled hand-tuned version chasing. See `reports/cap_zw_final_research_spec.md`, `reports/journal_protocol.md`, and `reports/publication_execution_plan.md`.
 
 ## LogPolar + DINOv2 + MRELBP comparison baseline
 
-To directly benchmark the competing design, the repository includes an independently reproducible **LogPolar+DINOv2+MRELBP** fusion baseline.
+To directly benchmark the competing design, the repository includes an independently reproducible **LogPolar+DINOv2+MRELBP** fusion baseline. The implementation uses official DINOv2 ViT-S/14 weights, a deterministic log-polar Fourier descriptor, and an explicitly labeled MRELBP-style multiscale median-local-pattern descriptor. The exact fusion is treated as a benchmark construction, not a claim of prior publication.
 
 ### Fusion pipeline
 
@@ -99,9 +88,9 @@ Medical image
           binary zero-hash
 ```
 
-The implementation is a benchmark fusion of established descriptor families; it is not a claim that this exact fusion was previously published. Scaler/PCA are fitted only on the fitting split and never on the locked test set.
+The scaler/PCA/projection are fitted only on the fitting split and never on the locked test split.
 
-Run it with the locked attack grid:
+Run the full hybrid benchmark with the common attack grid:
 
 ```bash
 python scripts/benchmark_logpolar_dino_mrelbp.py \
@@ -116,6 +105,65 @@ python scripts/benchmark_logpolar_dino_mrelbp.py \
   --device auto
 ```
 
+### Hybrid component ablation
+
+Run DINOv2-only, LogPolar-only, MRELBP-style-only, pairwise fusions, and the full three-way fusion:
+
+```bash
+python scripts/run_hybrid_component_ablation.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --fit-split train_val \
+  --split test \
+  --fit-limit 1000 \
+  --limit 200 \
+  --bits 256 \
+  --seed 42 \
+  --device auto
+```
+
+## CAP-ZW ablations
+
+The pre-registered CAP-ZW suite varies one mechanism at a time around the locked candidate:
+
+```text
+full CAP-ZW
+no selective robustness guard
+no binary collision pressure
+no hard-negative mining
+no memory bank
+fixed weighted sum instead of MGDA
+robustness-only reference
+```
+
+Run the screening suite:
+
+```bash
+python scripts/run_cap_zw_ablations.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --split train_val \
+  --limit 512 \
+  --size 128 \
+  --bits 128 \
+  --epochs 3 \
+  --batch-size 8 \
+  --seed 42 \
+  --device auto
+```
+
+Evaluate retained ablation checkpoints on the locked test split only after selection:
+
+```bash
+python scripts/evaluate_cap_zw_ablation_suite.py \
+  --manifest data/manifests/medical_manifest.csv \
+  --split test \
+  --limit 200 \
+  --size 128 \
+  --bits 128 \
+  --device auto
+```
+
+The final five-seed experiment is run only for shortlisted configurations.
+
 ## Reproducible experiment sequence
 
 ### 1. Environment
@@ -123,10 +171,8 @@ python scripts/benchmark_logpolar_dino_mrelbp.py \
 ```bash
 python -m pip install -r requirements.txt
 python -m pip install -e .
-python -m pytest -q
+python -m pytest -q tests
 ```
-
-The repository now pins conservative dependency ranges and explicitly limits pytest discovery to `tests/`, so experiment scripts under `scripts/` are not collected as tests.
 
 ### 2. Dataset
 
@@ -151,7 +197,7 @@ python scripts/train_cap_zw_final.py \
   --device auto
 ```
 
-### 4. Common classical/deep benchmark
+### 4. Run the common classical/deep benchmark
 
 ```bash
 python scripts/run_full_benchmark.py \
@@ -162,19 +208,17 @@ python scripts/run_full_benchmark.py \
   --bits 256
 ```
 
-This benchmark uses the locked common attack grid and reports robustness, discriminability, collision rates, tail separation and hash-quality statistics for DCT-Mean, DCT-Balanced, Edge-DCT and optional pretrained deep baselines.
-
 ### 5. Compare retained summaries
 
 ```bash
 python scripts/compare_cap_zw_vs_hybrid.py \
   --input "LogPolar+DINOv2+MRELBP=experiments/results/logpolar_dino_mrelbp/summary_seed_42.csv" \
-  --input "CAP-ZW=experiments/results/cap_zw_test/summary.csv"
+  "CAP-ZW=experiments/results/cap_zw_test/summary.csv"
 ```
 
-Additional baseline summaries can be added with more `--input LABEL=PATH` arguments. The comparison tool rejects incompatible split/image-count/hash-length/attack-grid metadata rather than silently comparing different protocols.
+The comparison tool verifies immutable protocol identity before reporting metric winners.
 
-### 6. Five-seed selection benchmark
+### 6. Five-seed CAP-ZW selection benchmark
 
 ```bash
 python scripts/run_cap_zw_multiseed.py \
@@ -190,13 +234,23 @@ python scripts/run_cap_zw_multiseed.py \
   --skip-existing
 ```
 
-Shortlisted configurations require five independent seeds for publication statistics; two seeds are reserved for early smoke screening.
+Aggregate seed-level results with protocol checks:
 
-## Publication analysis
+```bash
+python scripts/aggregate_multi_seed.py \
+  experiments/results/final_multiseed/seed_13 \
+  experiments/results/final_multiseed/seed_23 \
+  experiments/results/final_multiseed/seed_42 \
+  experiments/results/final_multiseed/seed_73 \
+  experiments/results/final_multiseed/seed_97 \
+  --require-seeds 5
+```
 
-Use the analysis notebooks to generate paper tables and figures only from retained seed-level outputs. Report mean, standard deviation and 95% confidence intervals across seeds. Always retain the negative-pair denominator for collision statistics.
+## Publication decision rule
 
-For the external feature-fusion baseline, do not compare literature classification accuracy with CAP-ZW watermarking metrics. The proper comparison is an end-to-end hash/verification benchmark under the same images, attacks, hash length and evaluator.
+Selection uses training/validation data. The test split is evaluated only after the candidate is locked. The primary scientific evidence is collision-tail risk and exact/near collision rate, followed by robustness and verification discrimination. Hash quality and computational cost are secondary criteria.
+
+If another method wins, report it. The benchmark is designed to determine whether the CAP-ZW hypothesis is supported, not to guarantee a win.
 
 ## Reproducibility
 
