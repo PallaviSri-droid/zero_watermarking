@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,15 @@ ATTACK_GRID = (
 )
 
 
+def _config_from_checkpoint(payload: dict, device: str) -> StableConfig:
+    raw = dict(payload.get("config", {}))
+    valid = {field.name for field in fields(StableConfig)}
+    filtered = {key: value for key, value in raw.items() if key in valid}
+    cfg = StableConfig(**filtered)
+    cfg.device = device
+    return cfg
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Evaluate stable CAP-DINO-LogPolar repair.")
     ap.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
@@ -48,8 +58,7 @@ def main() -> int:
         frame = frame[frame["split"].astype(str).eq(args.split)].reset_index(drop=True)
     frame = frame.head(args.limit)
     payload = torch.load(ckpt, map_location=device, weights_only=False)
-    cfg = StableConfig(**payload.get("config", {}))
-    cfg.device = device
+    cfg = _config_from_checkpoint(payload, device)
     model = CAPDinoLogPolarStable(cfg)
     model.load_state_dict(payload["model"])
     model.eval()
@@ -71,17 +80,15 @@ def main() -> int:
                     params["seed"] = int(params.get("seed", 0)) + index
                 attacked = ATTACKS[name](image, **params)
                 ax = torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None, None]).to(device)
-                # Exact same inference path and clean routing used by training.
                 pair = model.forward_pair(x, ax)
-                code = pair["attacked_hard"]
-                attacked_bank[row.image_id][f"{name}_{index}"] = code.round().to(torch.uint8).cpu().numpy()[0]
+                attacked_bank[row.image_id][f"{name}_{index}"] = pair["attacked_hard"].round().to(torch.uint8).cpu().numpy()[0]
 
     result = evaluate_hash_bank(clean_bank, attacked_bank)
     matrix = np.stack([clean_bank[k] for k in sorted(clean_bank)])
     entropy, _ = bit_entropy(matrix)
     stats = result["collision_statistics"]
     gates = np.stack([gate_bank[k] for k in sorted(gate_bank)])
-    gate_entropy = -(np.clip(gates, 1e-8, 1.0) * np.log(np.clip(gates, 1e-8, 1.0))).sum(axis=1)
+    gate_entropy_values = -(np.clip(gates, 1e-8, 1.0) * np.log(np.clip(gates, 1e-8, 1.0))).sum(axis=1)
     dominant = np.argmax(gates, axis=1)
     summary = {
         "version": str(payload.get("version", STABLE_VERSION)),
@@ -119,14 +126,33 @@ def main() -> int:
         "gate_cap_mean": float(gates[:, 0].mean()),
         "gate_dino_mean": float(gates[:, 1].mean()),
         "gate_logpolar_mean": float(gates[:, 2].mean()),
-        "gate_entropy_mean": float(gate_entropy.mean()),
+        "gate_cap_std": float(gates[:, 0].std()),
+        "gate_dino_std": float(gates[:, 1].std()),
+        "gate_logpolar_std": float(gates[:, 2].std()),
+        "gate_entropy_mean": float(gate_entropy_values.mean()),
+        "gate_entropy_std": float(gate_entropy_values.std()),
         "fraction_cap_dominant": float(np.mean(dominant == 0)),
         "fraction_dino_dominant": float(np.mean(dominant == 1)),
         "fraction_logpolar_dominant": float(np.mean(dominant == 2)),
     }
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([summary]).to_csv(out / "summary.csv", index=False)
     pd.DataFrame(result["details"], columns=["image_id", "attack", "hamming", "nc"]).to_csv(out / "attack_details.csv", index=False)
+    gate_rows = [
+        {"image_id": k, "gate_cap": float(v[0]), "gate_dino": float(v[1]), "gate_logpolar": float(v[2])}
+        for k, v in sorted(gate_bank.items())
+    ]
+    pd.DataFrame(gate_rows).to_csv(out / "gates.csv", index=False)
+    ids = sorted(clean_bank)
+    pairs: list[dict[str, object]] = []
+    for i, left in enumerate(ids):
+        for right in ids[i + 1:]:
+            d = float(np.mean(clean_bank[left] != clean_bank[right]))
+            if d <= args.near_threshold:
+                pairs.append({"image_a": left, "image_b": right, "hamming": d, "exact_collision": d == 0.0, "near_collision": True})
+    pd.DataFrame(pairs, columns=["image_a", "image_b", "hamming", "exact_collision", "near_collision"]).to_csv(out / "collision_pairs.csv", index=False)
     print(pd.Series(summary).to_string())
     print(f"Results written to {out.resolve()}")
     return 0
