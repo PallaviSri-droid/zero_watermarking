@@ -207,6 +207,7 @@ def _binary_collision(codes: Tensor, labels: Tensor, target: float, topk: int) -
     neg = dist.masked_fill(labels[:, None].eq(labels[None, :]), float("inf"))
     fill = torch.where(torch.isfinite(neg), neg, torch.full_like(neg, 2.0))
     kk = min(max(int(topk), 1), fill.shape[1])
+    vals = torch.topk(fill, kk, largest=False, dim=1).values
     vals = torch.topk(fill, kk, largest=False).values
     tail = F.relu(float(target) - vals[:, 0]).pow(2)
     mass = F.relu(float(target) - vals).pow(2).mean(dim=1)
@@ -221,6 +222,7 @@ def _memory_binary_collision(codes: Tensor, labels: Tensor, memory_codes: Tensor
         md = md.masked_fill(labels[:, None].eq(memory_labels.detach()[None, :]), float("inf"))
     fill = torch.where(torch.isfinite(md), md, torch.full_like(md, 2.0))
     kk = min(max(int(topk), 1), fill.shape[1])
+    vals = torch.topk(fill, kk, largest=False, dim=1).values
     vals = torch.topk(fill, kk, largest=False).values
     tail = F.relu(float(target) - vals[:, 0]).pow(2)
     mass = F.relu(float(target) - vals).pow(2).mean(dim=1)
@@ -289,6 +291,12 @@ def v7_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: Tensor |
         + config.lambda_decorrelation * decor
         + config.lambda_gate_usage * gate_usage
         + config.lambda_gate_diversity * gate_diversity
+        + config.lambda_gate_dominance * gate_dominance
+        + config.lambda_mixer_consistency * mixer_consistency
+    )
+    loss = torch.nan_to_num(loss, nan=10.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+
+    terms = {
         + config.lambda_mixer_consistency * mixer_consistency
     )
     return loss, {
@@ -307,6 +315,18 @@ def v7_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: Tensor |
         "decorrelation": decor,
         "gate_usage": gate_usage,
         "gate_diversity": gate_diversity,
+        "gate_dominance": gate_dominance,
+        "mixer_consistency": mixer_consistency,
+        "observed_entropy": entropy_obs,
+        "observed_balance": balance_obs,
+        "observed_robustness": soft_d.mean().detach(),
+        "observed_hard_robustness": hard_d.detach().mean(),
+        "observed_gate_std": gate_std.detach(),
+        "observed_gate_max": gates.max(dim=1).values.detach().mean(),
+        "observed_q05": torch.quantile(inter.detach(), 0.05) if inter.numel() else clean_s.new_tensor(0.0),
+        "observed_q10": torch.quantile(inter.detach(), 0.10) if inter.numel() else clean_s.new_tensor(0.0),
+    }
+    return loss, terms
         "observed_entropy": entropy_obs,
         "observed_balance": balance_obs,
         "observed_robustness": soft_d.mean().detach(),
