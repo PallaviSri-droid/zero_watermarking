@@ -53,11 +53,11 @@ class CAPDinoLogPolarRelational(CAPDinoLogPolarStable):
 
     def relational_features(self, x: Tensor) -> Tensor:
         tokens = self.dino_patch_tokens(x)
-        b, n, _ = tokens.shape
+        batch, n, _ = tokens.shape
         side = int(round(n ** 0.5))
         if side * side != n:
             raise RuntimeError(f"Expected square DINO patch grid, got {n} tokens")
-        grid = F.normalize(tokens, dim=-1).reshape(b, side, side, -1)
+        grid = F.normalize(tokens, dim=-1).reshape(batch, side, side, -1)
         offsets = ((0,1),(1,0),(1,1),(1,-1),(0,2),(2,0),(2,2),(2,-2),(0,3),(3,0),(3,3),(3,-3))
         values: list[Tensor] = []
         for dy, dx in offsets:
@@ -66,10 +66,13 @@ class CAPDinoLogPolarRelational(CAPDinoLogPolarStable):
             a = grid[:, y0:y1, x0:x1]
             b2 = grid[:, y0 + dy:y1 + dy, x0 + dx:x1 + dx]
             sim = (a * b2).sum(dim=-1)
-            values.append(sim.mean(dim=(1,2)))
-            values.append(sim.std(dim=(1,2), unbiased=False))
+            values.append(sim.mean(dim=(1, 2)))
+            values.append(sim.std(dim=(1, 2), unbiased=False))
         rel = torch.stack(values, dim=-1)
-        return _finite((rel - rel.mean(dim=0, keepdim=True)) / rel.std(dim=0, unbiased=False).clamp_min(1e-3), 10.0)
+        # Per-image normalization keeps inference independent of batch size.
+        rel_mean = rel.mean(dim=-1, keepdim=True)
+        rel_std = rel.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-3)
+        return _finite((rel - rel_mean) / rel_std, 10.0)
 
     def _relational_residual(self, x: Tensor) -> Tensor:
         return self.relation_project(self.relational_features(x)) * self.relation_scale
@@ -101,7 +104,7 @@ def relational_objective(pair: dict[str, Tensor], labels: Tensor, memory_codes: 
     loss = loss + float(config.lambda_relation_consistency) * relation_consistency
     terms = dict(terms)
     terms["relation_consistency"] = relation_consistency
-    terms["relation_scale"] = torch.sigmoid(pair["clean_relational"].new_tensor(0.0)) * float(config.relation_weight)
+    terms["relation_scale"] = torch.sigmoid(pair["clean_relational"].new_tensor(float(config.relation_scale_init))) * float(config.relation_weight)
     return loss, terms
 
 __all__ = ["RELATIONAL_VERSION", "RelationalConfig", "CAPDinoLogPolarRelational", "relational_objective"]
