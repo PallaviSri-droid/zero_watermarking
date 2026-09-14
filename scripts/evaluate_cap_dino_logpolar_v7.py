@@ -37,6 +37,15 @@ def load_model(checkpoint: Path, device: str):
     return model, payload
 
 
+def _code_and_gates(model: CAPDinoLogPolarV7, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate both code and routing from the exact same v7 forward path."""
+    cap, dino, lp = model.encode_branches(x)
+    gates = model.gate(cap, dino, lp)
+    fused, _ = model._fused_v7(cap, dino, lp, gates)
+    code = model.quantizer(model.fusion(fused), hard=True)
+    return code, gates
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Evaluate CAP-DINO-LogPolar v7 on the locked benchmark.")
     ap.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
@@ -69,8 +78,8 @@ def main() -> int:
         for row in frame.itertuples(index=False):
             image = load_image(row.path, args.size)
             x = torch.from_numpy(image[None, None]).to(device)
-            clean, gates = model.forward_with_gate(x, hard=True) if hasattr(model, "forward_with_gate") else (model.forward(x, hard=True), model.gate(*model.encode_branches(x)))
-            clean_bank[row.image_id] = clean.round().to(torch.uint8).cpu().numpy()[0]
+            clean, gates = _code_and_gates(model, x)
+            clean_bank[row.image_id] = clean.to(torch.uint8).cpu().numpy()[0]
             gate_bank[row.image_id] = gates.cpu().numpy()[0]
             attacked_bank[row.image_id] = {}
             for index, (attack_name, kwargs) in enumerate(ATTACK_GRID):
@@ -79,8 +88,8 @@ def main() -> int:
                     params["seed"] = int(params.get("seed", 0)) + index
                 attacked = ATTACKS[attack_name](image, **params)
                 ax = torch.from_numpy(np.asarray(attacked, dtype=np.float32)[None, None]).to(device)
-                code = model.forward(ax, hard=True)
-                attacked_bank[row.image_id][f"{attack_name}_{index}"] = code.round().to(torch.uint8).cpu().numpy()[0]
+                code, _ = _code_and_gates(model, ax)
+                attacked_bank[row.image_id][f"{attack_name}_{index}"] = code.to(torch.uint8).cpu().numpy()[0]
 
     result = evaluate_hash_bank(clean_bank, attacked_bank)
     matrix = np.stack([clean_bank[k] for k in sorted(clean_bank)])
