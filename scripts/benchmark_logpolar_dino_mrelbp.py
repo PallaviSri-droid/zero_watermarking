@@ -8,26 +8,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from zero_watermarking.attacks import ATTACKS
 from zero_watermarking.datasets import load_image, load_manifest, validate_manifest
 from zero_watermarking.logpolar_dino_mrelbp import HybridConfig, LogPolarDinoMRELBP
 from zero_watermarking.metrics import evaluate_hash_bank
-from zero_watermarking.protocol import seed_everything
-
-
-ATTACK_GRID = {
-    "gaussian_noise": {"sigma": 0.05},
-    "gaussian_blur": {"sigma": 1.0},
-    "jpeg": {"quality": 70},
-    "rotation": {"degrees": 5.0},
-    "crop_resize": {"fraction": 0.05},
-    "translation": {"pixels": 4},
-    "compound": {},
-}
+from zero_watermarking.protocol import DEFAULT_ATTACK_GRID, attack_grid, seed_everything
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Benchmark LogPolar + DINOv2 + MRELBP against the common CAP-ZW evaluator.")
+    ap = argparse.ArgumentParser(description="Benchmark LogPolar + DINOv2 + MRELBP with the common CAP-ZW attack/metric protocol.")
     ap.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
     ap.add_argument("--split", default="test")
     ap.add_argument("--fit-split", default="train_val")
@@ -68,10 +56,10 @@ def main() -> int:
         clean_bank[image_id] = clean_hashes[idx]
         attacked_bank[image_id] = {}
         image = test_images[idx]
-        for attack_name, kwargs in ATTACK_GRID.items():
-            attack = ATTACKS[attack_name]
-            attacked = attack(image, seed=args.seed + idx, **kwargs)
-            attacked_bank[image_id][attack_name] = method.transform(attacked[None, ...])[0]
+        generated = attack_grid(image, DEFAULT_ATTACK_GRID, seed=args.seed + idx)
+        for attack_name, by_strength in generated.items():
+            for strength, attacked in by_strength.items():
+                attacked_bank[image_id][f"{attack_name}_{strength:g}"] = method.transform(attacked[None, ...])[0]
     eval_seconds = time.perf_counter() - t1
 
     metrics = evaluate_hash_bank(clean_bank, attacked_bank)
@@ -89,7 +77,9 @@ def main() -> int:
         "evaluation_seconds": eval_seconds,
         **{k: float(v) for k, v in metrics.items() if isinstance(v, (float, int, np.floating, np.integer))},
         **collision,
-        "attack_grid": json.dumps(ATTACK_GRID, sort_keys=True),
+        "attack_grid": json.dumps(
+            [spec.__dict__ for spec in DEFAULT_ATTACK_GRID], sort_keys=True, default=str
+        ),
     }
 
     output = Path(args.output)
@@ -99,7 +89,15 @@ def main() -> int:
         output / f"details_seed_{args.seed}.csv", index=False
     )
     (output / f"config_seed_{args.seed}.json").write_text(
-        json.dumps({"method": config.__dict__, "attack_grid": ATTACK_GRID, "manifest": args.manifest}, indent=2, default=str),
+        json.dumps(
+            {
+                "method": config.__dict__,
+                "attack_grid": [spec.__dict__ for spec in DEFAULT_ATTACK_GRID],
+                "manifest": args.manifest,
+            },
+            indent=2,
+            default=str,
+        ),
         encoding="utf-8",
     )
     print(json.dumps({k: v for k, v in out.items() if k != "attack_grid"}, indent=2, default=float))
