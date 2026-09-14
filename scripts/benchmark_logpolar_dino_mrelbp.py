@@ -12,10 +12,11 @@ from zero_watermarking.datasets import load_image, load_manifest, validate_manif
 from zero_watermarking.logpolar_dino_mrelbp import HybridConfig, LogPolarDinoMRELBP
 from zero_watermarking.metrics import evaluate_hash_bank
 from zero_watermarking.protocol import DEFAULT_ATTACK_GRID, attack_grid, seed_everything
+from zero_watermarking.research_contract import attack_grid_fingerprint, manifest_fingerprint
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Benchmark LogPolar + DINOv2 + MRELBP with the common CAP-ZW attack/metric protocol.")
+    ap = argparse.ArgumentParser(description="Benchmark LogPolar + DINOv2 + MRELBP under the locked CAP-ZW protocol.")
     ap.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
     ap.add_argument("--split", default="test")
     ap.add_argument("--fit-split", default="train_val")
@@ -68,18 +69,18 @@ def main() -> int:
         "method": "LogPolar+DINOv2+MRELBP",
         "seed": args.seed,
         "fit_split": args.fit_split,
-        "eval_split": args.split,
+        "split": args.split,
+        "images": len(test_images),
         "fit_images": len(fit_images),
-        "test_images": len(test_images),
         "bits": args.bits,
         "image_size": args.size,
         "fit_seconds": fit_seconds,
         "evaluation_seconds": eval_seconds,
+        "manifest_id": manifest_fingerprint(args.manifest),
+        "attack_grid_id": attack_grid_fingerprint(DEFAULT_ATTACK_GRID),
         **{k: float(v) for k, v in metrics.items() if isinstance(v, (float, int, np.floating, np.integer))},
         **collision,
-        "attack_grid": json.dumps(
-            [spec.__dict__ for spec in DEFAULT_ATTACK_GRID], sort_keys=True, default=str
-        ),
+        "attack_grid": json.dumps([spec.__dict__ for spec in DEFAULT_ATTACK_GRID], sort_keys=True, default=str),
     }
 
     output = Path(args.output)
@@ -94,6 +95,8 @@ def main() -> int:
                 "method": config.__dict__,
                 "attack_grid": [spec.__dict__ for spec in DEFAULT_ATTACK_GRID],
                 "manifest": args.manifest,
+                "manifest_id": manifest_fingerprint(args.manifest),
+                "attack_grid_id": attack_grid_fingerprint(DEFAULT_ATTACK_GRID),
             },
             indent=2,
             default=str,
