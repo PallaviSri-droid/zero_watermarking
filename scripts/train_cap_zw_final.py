@@ -14,8 +14,13 @@ from zero_watermarking.synthetic import make_dataset
 DEFAULT_ATTACKS = ("gaussian_noise", "gaussian_blur", "jpeg", "rotation", "compound")
 
 
+def _bool_pair(ap: argparse.ArgumentParser, name: str, default: bool) -> None:
+    ap.add_argument(name, dest=name.lstrip("-").replace("-", "_"), action="store_true", default=default)
+    ap.add_argument("--no-" + name.lstrip("-").replace("-", "_"), dest=name.lstrip("-").replace("-", "_"), action="store_false")
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Train the locked CAP-ZW research candidate.")
+    ap = argparse.ArgumentParser(description="Train the locked CAP-ZW research candidate or a pre-registered ablation.")
     ap.add_argument("--manifest", default="data/manifests/medical_manifest.csv")
     ap.add_argument("--split", default="train_val")
     ap.add_argument("--limit", type=int, default=5000)
@@ -29,6 +34,30 @@ def main() -> int:
     ap.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     ap.add_argument("--checkpoint", default="experiments/checkpoints/cap_zw_final_seed42.pt")
     ap.add_argument("--history", default="experiments/results/cap_zw_final_seed42_training_history.csv")
+    ap.add_argument("--experiment-name", default=CAP_ZW_FINAL)
+    ap.add_argument("--lambda-robust", type=float, default=None)
+    ap.add_argument("--lambda-tail", type=float, default=None)
+    ap.add_argument("--lambda-diversity", type=float, default=None)
+    ap.add_argument("--lambda-balance", type=float, default=None)
+    ap.add_argument("--lambda-corr", type=float, default=None)
+    ap.add_argument("--lambda-entropy", type=float, default=None)
+    ap.add_argument("--lambda-uniformity", type=float, default=None)
+    ap.add_argument("--lambda-consistency", type=float, default=None)
+    ap.add_argument("--lambda-binary-collision", type=float, default=None)
+    ap.add_argument("--topk-negatives", type=int, default=None)
+    ap.add_argument("--binary-collision-target", type=float, default=None)
+    ap.add_argument("--guard-batch-fraction", type=float, default=None)
+    ap.add_argument("--guard-lambda", type=float, default=None)
+    ap.add_argument("--guard-growth", type=float, default=None)
+    ap.add_argument("--guard-max", type=float, default=None)
+    ap.add_argument("--no-selective-guard", dest="enable_selective_guard", action="store_false")
+    ap.set_defaults(enable_selective_guard=True)
+    ap.add_argument("--no-hard-negative-mining", dest="enable_hard_negative_mining", action="store_false")
+    ap.set_defaults(enable_hard_negative_mining=True)
+    ap.add_argument("--no-memory-bank", dest="enable_memory_bank", action="store_false")
+    ap.set_defaults(enable_memory_bank=True)
+    ap.add_argument("--no-mgda", dest="enable_mgda", action="store_false")
+    ap.set_defaults(enable_mgda=True)
     args = ap.parse_args()
 
     seed_everything(args.seed)
@@ -49,9 +78,6 @@ def main() -> int:
         generated = make_dataset(args.images, args.size)
         images = np.stack([generated[i] for i in sorted(generated)])
 
-    # Each image receives a unique identity label. Patient/group identifiers are
-    # used for leakage-safe splitting, not as a reason to collapse two different
-    # images into the same watermark identity.
     labels = np.arange(len(images), dtype=np.int64)
     dataset = PairAttackDataset(images, labels, attack_names=DEFAULT_ATTACKS, attack_views=3)
     loader = torch.utils.data.DataLoader(
@@ -63,24 +89,46 @@ def main() -> int:
         generator=torch.Generator().manual_seed(args.seed),
     )
 
+    override = {}
+    for key in (
+        "lambda_robust", "lambda_tail", "lambda_diversity", "lambda_balance", "lambda_corr",
+        "lambda_entropy", "lambda_uniformity", "lambda_consistency", "lambda_binary_collision",
+        "topk_negatives", "binary_collision_target", "robustness_guard_batch_fraction",
+        "robustness_guard_lambda_init", "robustness_guard_lambda_growth", "robustness_guard_lambda_max",
+    ):
+        arg = key
+        if key == "robustness_guard_batch_fraction":
+            arg = "guard_batch_fraction"
+        elif key == "robustness_guard_lambda_init":
+            arg = "guard_lambda"
+        elif key == "robustness_guard_lambda_growth":
+            arg = "guard_growth"
+        elif key == "robustness_guard_lambda_max":
+            arg = "guard_max"
+        value = getattr(args, arg, None)
+        if value is not None:
+            override[key] = value
+    override.update({
+        "enable_selective_guard": args.enable_selective_guard,
+        "enable_hard_negative_mining": args.enable_hard_negative_mining,
+        "enable_memory_bank": args.enable_memory_bank,
+        "enable_mgda": args.enable_mgda,
+    })
+
     config = FinalCAPZWConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         nbits=args.bits,
         device=device,
+        **override,
     )
     model = CAPZWHashNet(nbits=args.bits)
-    history = train_cap_zw_v11(
-        model,
-        loader,
-        config,
-        checkpoint=args.checkpoint,
-        history_path=args.history,
-    )
+    history = train_cap_zw_v11(model, loader, config, checkpoint=args.checkpoint, history_path=args.history)
     print(
-        f"Training complete: {CAP_ZW_FINAL} seed={args.seed} images={len(images)} "
-        f"effective_samples={len(dataset)} bits={args.bits} epochs={len(history)} device={device}"
+        f"Training complete: {args.experiment_name} version={CAP_ZW_FINAL} seed={args.seed} "
+        f"images={len(images)} effective_samples={len(dataset)} bits={args.bits} "
+        f"epochs={len(history)} device={device}"
     )
     print(f"checkpoint={Path(args.checkpoint).resolve()}")
     print(f"history={Path(args.history).resolve()}")
