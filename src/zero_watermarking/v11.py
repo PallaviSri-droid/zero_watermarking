@@ -24,9 +24,8 @@ CAP_ZW_V11_VERSION = "CAP-ZW-v11"
 
 @dataclass
 class V11Config(TrainConfig):
-    """CAP-ZW-v11: selective robustness protection with Pareto-preserving collision pressure."""
+    """CAP-ZW-v11 with explicit switches for controlled component ablations."""
 
-    # Start closer to v9 than v10, then protect only the worst robustness tail.
     lambda_binary_collision: float = 1.38
     lambda_consistency: float = 1.00
     lambda_corr: float = 0.25
@@ -40,6 +39,12 @@ class V11Config(TrainConfig):
     robustness_guard_tail_weight: float = 0.70
     robustness_guard_mean_weight: float = 0.20
     robustness_guard_batch_fraction: float = 0.25
+
+    # Research controls. Keep all True for the locked candidate.
+    enable_selective_guard: bool = True
+    enable_hard_negative_mining: bool = True
+    enable_memory_bank: bool = True
+    enable_mgda: bool = True
 
 
 def _selective_robustness_guard(
@@ -57,21 +62,16 @@ def _selective_robustness_guard(
     if per_sample.numel() == 0:
         zero = clean.new_zeros(())
         return zero, zero, zero, clean.new_zeros((0,))
-
     q = float(min(max(quantile, 0.5), 0.99))
     q_value = torch.quantile(per_sample, q)
     target_t = clean.new_tensor(float(target))
     beta = max(float(softness), 1e-4)
-
-    # Focus explicitly on the worst quarter (or configured fraction) while retaining
-    # a smooth high-quantile term so the guard does not collapse to one sample.
     fraction = float(min(max(batch_fraction, 0.05), 0.50))
     count = max(1, int(np.ceil(per_sample.numel() * fraction)))
     worst_values = torch.topk(per_sample, count, largest=True).values
     worst_penalty = F.softplus((worst_values - target_t) / beta).mul(beta).mean()
     q_penalty = F.softplus((q_value - target_t) / beta).mul(beta)
     mean_penalty = F.softplus((per_sample.mean() - target_t) / beta).mul(beta)
-
     penalty = float(tail_weight) * (worst_penalty + 0.50 * q_penalty) + float(mean_weight) * mean_penalty
     violation = (
         float(tail_weight) * (F.relu(worst_values - target_t).mean() + 0.50 * F.relu(q_value - target_t))
@@ -87,7 +87,7 @@ def train_cap_zw_v11(
     checkpoint: str | None = None,
     history_path: str | None = None,
 ) -> list[dict[str, float]]:
-    """Train CAP-ZW-v11 using selective robustness protection instead of a global guard."""
+    """Train CAP-ZW-v11; switches are only for pre-registered ablations."""
     device = torch.device(config.device)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -119,25 +119,33 @@ def train_cap_zw_v11(
             clean = model(clean_x, hard=False)
             attacked = model(attacked_x, hard=False)
 
-            progress = min(1.0, memory_codes.shape[0] / max(config.memory_warmup, 1))
+            use_memory = config.enable_memory_bank
+            memory_for_loss = memory_codes if (use_memory and memory_codes.numel() > 0) else None
+            memory_labels_for_loss = memory_labels if (use_memory and memory_labels.numel() > 0) else None
+            progress = min(1.0, memory_codes.shape[0] / max(config.memory_warmup, 1)) if use_memory else 0.0
             schedule = min(1.0, (epoch + 1) / max(config.epochs * 0.60, 1.0))
             active_margin = 0.18 + (float(config.margin) - 0.18) * schedule
             active_tail = 0.14 + (float(config.tail_target) - 0.14) * schedule
             active_diversity = 0.20 + (float(config.diversity_target) - 0.20) * schedule
             active_binary = 0.08 + (float(config.binary_collision_target) - 0.08) * schedule
+            # When hard-negative mining is disabled, use all finite negatives rather than top-k.
+            pair_count = int(clean.shape[0] * 2)
+            effective_topk = config.topk_negatives if config.enable_hard_negative_mining else max(pair_count, int(memory_codes.shape[0]), 1)
 
             terms = objective_terms(
                 clean, attacked, labels, active_margin,
-                memory_codes if progress > 0 else None,
-                memory_labels if progress > 0 else None,
-                config.collision_power, config.topk_negatives,
+                memory_for_loss, memory_labels_for_loss,
+                config.collision_power, effective_topk,
                 active_diversity, active_tail,
                 config.uniformity_temperature, config.robustness_quantile,
                 config.robust_target, config.robust_softness,
                 active_binary,
             )
             tasks = [terms[name] for name in task_names]
-            mgda = mgda_weights(tasks, model, steps=config.mgda_steps)
+            if config.enable_mgda:
+                mgda = mgda_weights(tasks, model, steps=config.mgda_steps)
+            else:
+                mgda = torch.ones(len(tasks), dtype=clean.dtype, device=device) / len(tasks)
             scale = torch.tensor([
                 config.lambda_robust, config.lambda_tail, config.lambda_diversity,
                 config.lambda_balance, config.lambda_corr, config.lambda_entropy,
@@ -148,8 +156,7 @@ def train_cap_zw_v11(
             base_loss = sum(weight * task for weight, task in zip(effective, tasks))
 
             guard, violation, guard_q, worst_values = _selective_robustness_guard(
-                clean,
-                attacked,
+                clean, attacked,
                 config.robustness_guard_target,
                 config.robustness_guard_quantile,
                 config.robustness_guard_softness,
@@ -157,34 +164,35 @@ def train_cap_zw_v11(
                 config.robustness_guard_mean_weight,
                 config.robustness_guard_batch_fraction,
             )
-            # Guard ramps in slowly and only becomes material when the protected
-            # robustness tail exceeds the budget. This avoids the v10 collapse in
-            # entropy/balance caused by globally strong robustness pressure.
+            if not config.enable_selective_guard:
+                guard = guard.detach() * 0.0
+                violation = violation.detach() * 0.0
             guard_warmup = min(1.0, (epoch + 1) / max(config.epochs * 0.50, 1.0))
-            observed_violation = float(violation.detach())
+            observed_violation = float(violation)
             normalized_violation = observed_violation / max(config.robustness_guard_target, 1e-6)
             adaptive = 1.0 + min(1.0, max(0.0, normalized_violation))
-            guard_weight = guard_multiplier * (0.35 + 0.35 * guard_warmup) * adaptive
+            guard_weight = guard_multiplier * (0.35 + 0.35 * guard_warmup) * adaptive if config.enable_selective_guard else 0.0
             loss = base_loss + guard_weight * guard
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
-            memory_codes, memory_labels = _update_memory(
-                memory_codes, memory_labels, clean, labels, config.memory_size
-            )
 
-            if observed_violation > 0.0:
-                guard_multiplier = min(
-                    float(config.robustness_guard_lambda_max),
-                    guard_multiplier + float(config.robustness_guard_lambda_growth) * min(1.0, normalized_violation),
+            if use_memory:
+                memory_codes, memory_labels = _update_memory(
+                    memory_codes, memory_labels, clean, labels, config.memory_size
                 )
+            if config.enable_selective_guard:
+                if observed_violation > 0.0:
+                    guard_multiplier = min(
+                        float(config.robustness_guard_lambda_max),
+                        guard_multiplier + float(config.robustness_guard_lambda_growth) * min(1.0, normalized_violation),
+                    )
+                else:
+                    guard_multiplier = max(float(config.robustness_guard_lambda_init), guard_multiplier * 0.995)
             else:
-                guard_multiplier = max(
-                    float(config.robustness_guard_lambda_init),
-                    guard_multiplier * 0.995,
-                )
+                guard_multiplier = 0.0
 
             for key, value in terms.items():
                 totals[key] += float(value.detach())
